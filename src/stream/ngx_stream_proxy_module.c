@@ -39,6 +39,7 @@ typedef struct {
     ngx_flag_t                       half_close;
     ngx_stream_upstream_local_t     *local;
     ngx_flag_t                       socket_keepalive;
+    ngx_uint_t                       socket_mark;
     size_t                           socket_rcvbuf;
     size_t                           socket_sndbuf;
 
@@ -96,6 +97,8 @@ static void *ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_stream_proxy_socket_mark(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -193,6 +196,13 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
       ngx_conf_set_size_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_proxy_srv_conf_t, socket_sndbuf),
+      NULL },
+
+    { ngx_string("proxy_socket_mark"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_proxy_socket_mark,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, socket_mark),
       NULL },
 
     { ngx_string("proxy_connect_timeout"),
@@ -493,6 +503,8 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     if (pscf->socket_sndbuf) {
         u->peer.sndbuf = (int) pscf->socket_sndbuf;
     }
+
+    u->peer.so_mark = pscf->socket_mark;
 
     u->peer.type = c->type;
     u->start_sec = ngx_time();
@@ -2439,6 +2451,7 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     conf->proxy_protocol = NGX_CONF_UNSET_UINT;
     conf->local = NGX_CONF_UNSET_PTR;
     conf->socket_keepalive = NGX_CONF_UNSET;
+    conf->socket_mark = NGX_CONF_UNSET_UINT;
     conf->socket_rcvbuf = NGX_CONF_UNSET_SIZE;
     conf->socket_sndbuf = NGX_CONF_UNSET_SIZE;
     conf->half_close = NGX_CONF_UNSET;
@@ -2505,6 +2518,9 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->socket_rcvbuf, prev->socket_rcvbuf, 0);
 
     ngx_conf_merge_size_value(conf->socket_sndbuf, prev->socket_sndbuf, 0);
+
+    ngx_conf_merge_uint_value(conf->socket_mark,
+                              prev->socket_mark, 0);
 
     ngx_conf_merge_value(conf->half_close, prev->half_close, 0);
 
@@ -2813,6 +2829,36 @@ ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_proxy_socket_mark(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+#if (NGX_HAVE_SO_MARK)
+    char             *rv;
+    ngx_uint_t       *mark;
+    ngx_core_conf_t  *ccf;
+
+    rv = ngx_conf_set_uint32_slot(cf, cmd, conf);
+    if (rv != NGX_CONF_OK) {
+        return rv;
+    }
+
+    mark = (ngx_uint_t *) ((char *) conf + cmd->offset);
+    if (*mark != 0) {
+        ccf = (ngx_core_conf_t *) ngx_get_conf(cf->cycle->conf_ctx,
+                                               ngx_core_module);
+        ccf->socket_mark = 1;
+    }
+
+    return NGX_CONF_OK;
+#else
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"proxy_socket_mark\" is not supported on this "
+                       "platform");
+    return NGX_CONF_ERROR;
+#endif
 }
 
 

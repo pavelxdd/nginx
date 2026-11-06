@@ -70,6 +70,8 @@ struct ngx_peer_connection_s {
     const char                      *device;
 #endif
 
+    unsigned                         so_mark;
+
     unsigned                         cached:1;
     unsigned                         transparent:1;
     unsigned                         so_keepalive:1;
