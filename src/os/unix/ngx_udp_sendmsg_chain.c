@@ -318,8 +318,18 @@ ngx_set_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
 
 ngx_int_t
-ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
+ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr,
+    ngx_listening_t *ls)
 {
+#if (NGX_HAVE_TRANSPARENT_PROXY && defined IP_ORIGDSTADDR) \
+     || (NGX_HAVE_TRANSPARENT_PROXY && NGX_HAVE_INET6 \
+         && defined IPV6_ORIGDSTADDR)
+    ngx_uint_t  transparent;
+
+    transparent = ls->transparent;
+#else
+    (void) ls;
+#endif
 
 #if (NGX_HAVE_IP_RECVDSTADDR)
     struct in_addr       *addr;
@@ -339,7 +349,11 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
     if (cmsg->cmsg_level == IPPROTO_IP
         && cmsg->cmsg_type == IP_RECVDSTADDR
-        && local_sockaddr->sa_family == AF_INET)
+        && local_sockaddr->sa_family == AF_INET
+#if (NGX_HAVE_TRANSPARENT_PROXY && defined IP_ORIGDSTADDR)
+        && !transparent
+#endif
+       )
     {
         addr = (struct in_addr *) CMSG_DATA(cmsg);
         sin = (struct sockaddr_in *) local_sockaddr;
@@ -352,7 +366,11 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
     if (cmsg->cmsg_level == IPPROTO_IP
         && cmsg->cmsg_type == IP_PKTINFO
-        && local_sockaddr->sa_family == AF_INET)
+        && local_sockaddr->sa_family == AF_INET
+#if (NGX_HAVE_TRANSPARENT_PROXY && defined IP_ORIGDSTADDR)
+        && !transparent
+#endif
+       )
     {
         pkt = (struct in_pktinfo *) CMSG_DATA(cmsg);
         sin = (struct sockaddr_in *) local_sockaddr;
@@ -367,7 +385,11 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
     if (cmsg->cmsg_level == IPPROTO_IPV6
         && cmsg->cmsg_type == IPV6_PKTINFO
-        && local_sockaddr->sa_family == AF_INET6)
+        && local_sockaddr->sa_family == AF_INET6
+#if (NGX_HAVE_TRANSPARENT_PROXY && defined IPV6_ORIGDSTADDR)
+        && !transparent
+#endif
+       )
     {
         pkt6 = (struct in6_pktinfo *) CMSG_DATA(cmsg);
         sin6 = (struct sockaddr_in6 *) local_sockaddr;
@@ -382,7 +404,11 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
     if (cmsg->cmsg_level == IPPROTO_IP
         && cmsg->cmsg_type == IP_ORIGDSTADDR
-        && local_sockaddr->sa_family == AF_INET)
+        && local_sockaddr->sa_family == AF_INET
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        && transparent
+#endif
+       )
     {
         struct sockaddr_in  *sin4, *origdst4;
 
@@ -400,7 +426,11 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
     if (cmsg->cmsg_level == IPPROTO_IPV6
         && cmsg->cmsg_type == IPV6_ORIGDSTADDR
-        && local_sockaddr->sa_family == AF_INET6)
+        && local_sockaddr->sa_family == AF_INET6
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        && transparent
+#endif
+       )
     {
         struct sockaddr_in6  *sin6a, *origdst6;
 
