@@ -10,21 +10,42 @@
 #include <ngx_event.h>
 
 
+#define NGX_UDP_MAX_DATAGRAM_SIZE        65843
+#define NGX_UDP_SESSION_KEY_BUFFER_SIZE  64
+
+
 #if !(NGX_WIN32)
+
+ngx_int_t sfc_loop_udp_session_key(ngx_listening_t *ls,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    const u_char *buf, size_t len, u_char *storage, size_t storage_len,
+    ngx_str_t *key);
+ngx_int_t sfc_loop_udp_preread(ngx_connection_t *c, ngx_buf_t *b,
+    const u_char *route_key, size_t route_key_len);
+void ngx_stream_init_connection(ngx_connection_t *c);
+void ngx_stream_sfc_loop_udp_finalize(ngx_connection_t *c, ngx_int_t rc);
 
 static void ngx_close_accepted_udp_connection(ngx_connection_t *c);
 static ssize_t ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf,
     size_t size);
-static ngx_int_t ngx_insert_udp_connection(ngx_connection_t *c);
+static ngx_int_t ngx_udp_session_key(ngx_listening_t *ls,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    const u_char *buf, size_t len, u_char *storage, size_t storage_len,
+    ngx_str_t *key);
+static ngx_int_t ngx_insert_udp_connection(ngx_connection_t *c,
+    ngx_str_t *key, struct sockaddr *sockaddr);
 static ngx_connection_t *ngx_lookup_udp_connection(ngx_listening_t *ls,
     struct sockaddr *sockaddr, socklen_t socklen,
-    struct sockaddr *local_sockaddr, socklen_t local_socklen);
-
+    struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    ngx_str_t *key);
 
 void
 ngx_event_recvmsg(ngx_event_t *ev)
 {
     ssize_t            n;
+    ngx_int_t          rc;
     ngx_buf_t          buf;
     ngx_log_t         *log;
     ngx_err_t          err;
@@ -34,10 +55,12 @@ ngx_event_recvmsg(ngx_event_t *ev)
     struct msghdr      msg;
     ngx_sockaddr_t     sa, lsa;
     struct sockaddr   *sockaddr, *local_sockaddr;
+    ngx_str_t          key;
     ngx_listening_t   *ls;
     ngx_event_conf_t  *ecf;
     ngx_connection_t  *c, *lc;
-    static u_char      buffer[65535];
+    u_char              key_storage[NGX_UDP_SESSION_KEY_BUFFER_SIZE];
+    static u_char       buffer[NGX_UDP_MAX_DATAGRAM_SIZE];
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
     u_char             msg_control[CMSG_SPACE(sizeof(ngx_addrinfo_t))];
@@ -150,8 +173,17 @@ ngx_event_recvmsg(ngx_event_t *ev)
 
 #endif
 
-        c = ngx_lookup_udp_connection(ls, sockaddr, socklen, local_sockaddr,
-                                      local_socklen);
+        if (ngx_udp_session_key(ls, sockaddr, socklen,
+                                local_sockaddr, local_socklen,
+                                buffer, n, key_storage, sizeof(key_storage),
+                                &key)
+            != NGX_OK)
+        {
+            goto next;
+        }
+
+        c = ngx_lookup_udp_connection(ls, sockaddr, socklen,
+                                      local_sockaddr, local_socklen, &key);
 
         if (c) {
 
@@ -171,8 +203,11 @@ ngx_event_recvmsg(ngx_event_t *ev)
 
             ngx_memzero(&buf, sizeof(ngx_buf_t));
 
+            buf.start = buffer;
             buf.pos = buffer;
             buf.last = buffer + n;
+            buf.end = buffer + sizeof(buffer);
+            buf.temporary = 1;
 
             rev = c->read;
 
@@ -180,6 +215,20 @@ ngx_event_recvmsg(ngx_event_t *ev)
 
             rev->ready = 1;
             rev->active = 0;
+
+            if (c->listening->handler == ngx_stream_init_connection) {
+                rc = sfc_loop_udp_preread(c, &buf,
+                         c->udp->key.data == (u_char *) c->sockaddr
+                             ? NULL : c->udp->key.data,
+                         c->udp->key.data == (u_char *) c->sockaddr
+                             ? 0 : c->udp->key.len);
+
+                if (rc != NGX_OK && rc != NGX_DECLINED) {
+                    c->udp->buffer = NULL;
+                    ngx_stream_sfc_loop_udp_finalize(c, rc);
+                    goto next;
+                }
+            }
 
             rev->handler(rev);
 
@@ -328,7 +377,7 @@ ngx_event_recvmsg(ngx_event_t *ev)
         }
 #endif
 
-        if (ngx_insert_udp_connection(c) != NGX_OK) {
+        if (ngx_insert_udp_connection(c, &key, sockaddr) != NGX_OK) {
             ngx_close_accepted_udp_connection(c);
             return;
         }
@@ -444,8 +493,40 @@ ngx_udp_rbtree_insert_value(ngx_rbtree_node_t *temp,
 
 
 static ngx_int_t
-ngx_insert_udp_connection(ngx_connection_t *c)
+ngx_udp_session_key(ngx_listening_t *ls, struct sockaddr *sockaddr,
+    socklen_t socklen, struct sockaddr *local_sockaddr,
+    socklen_t local_socklen, const u_char *buf, size_t len, u_char *storage,
+    size_t storage_len, ngx_str_t *key)
 {
+    ngx_str_t  parsed;
+
+    key->data = (u_char *) sockaddr;
+    key->len = socklen;
+
+    if (ls->handler != ngx_stream_init_connection
+        || sfc_loop_udp_session_key(ls, sockaddr, socklen,
+                                    local_sockaddr, local_socklen,
+                                    buf, len, storage, storage_len, &parsed)
+           != NGX_OK)
+    {
+        return NGX_OK;
+    }
+
+    if (parsed.data != storage || parsed.len == 0 || parsed.len > storage_len) {
+        return NGX_OK;
+    }
+
+    *key = parsed;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_insert_udp_connection(ngx_connection_t *c, ngx_str_t *key,
+    struct sockaddr *sockaddr)
+{
+    u_char                *copy;
     uint32_t               hash;
     ngx_pool_cleanup_t    *cln;
     ngx_udp_connection_t  *udp;
@@ -461,8 +542,23 @@ ngx_insert_udp_connection(ngx_connection_t *c)
 
     udp->connection = c;
 
+    if (key->data == (u_char *) sockaddr) {
+        udp->key.data = (u_char *) c->sockaddr;
+        udp->key.len = c->socklen;
+
+    } else {
+        copy = ngx_pnalloc(c->pool, key->len);
+        if (copy == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(copy, key->data, key->len);
+        udp->key.data = copy;
+        udp->key.len = key->len;
+    }
+
     ngx_crc32_init(hash);
-    ngx_crc32_update(&hash, (u_char *) c->sockaddr, c->socklen);
+    ngx_crc32_update(&hash, key->data, key->len);
 
     if (c->listening->wildcard) {
         ngx_crc32_update(&hash, (u_char *) c->local_sockaddr, c->local_socklen);
@@ -471,8 +567,6 @@ ngx_insert_udp_connection(ngx_connection_t *c)
     ngx_crc32_final(hash);
 
     udp->node.key = hash;
-    udp->key.data = (u_char *) c->sockaddr;
-    udp->key.len = c->socklen;
 
     cln = ngx_pool_cleanup_add(c->pool, 0);
     if (cln == NULL) {
@@ -507,7 +601,8 @@ ngx_delete_udp_connection(void *data)
 
 static ngx_connection_t *
 ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
-    socklen_t socklen, struct sockaddr *local_sockaddr, socklen_t local_socklen)
+    socklen_t socklen, struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    ngx_str_t *key)
 {
     uint32_t               hash;
     ngx_int_t              rc;
@@ -517,7 +612,7 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
 
 #if (NGX_HAVE_UNIX_DOMAIN)
 
-    if (sockaddr->sa_family == AF_UNIX) {
+    if (key->data == (u_char *) sockaddr && sockaddr->sa_family == AF_UNIX) {
         struct sockaddr_un *saun = (struct sockaddr_un *) sockaddr;
 
         if (socklen <= (socklen_t) offsetof(struct sockaddr_un, sun_path)
@@ -535,7 +630,7 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
     sentinel = ls->rbtree.sentinel;
 
     ngx_crc32_init(hash);
-    ngx_crc32_update(&hash, (u_char *) sockaddr, socklen);
+    ngx_crc32_update(&hash, key->data, key->len);
 
     if (ls->wildcard) {
         ngx_crc32_update(&hash, (u_char *) local_sockaddr, local_socklen);
@@ -561,8 +656,7 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
 
         c = udp->connection;
 
-        rc = ngx_cmp_sockaddr(sockaddr, socklen,
-                              c->sockaddr, c->socklen, 1);
+        rc = ngx_memn2cmp(key->data, udp->key.data, key->len, udp->key.len);
 
         if (rc == 0 && ls->wildcard) {
             rc = ngx_cmp_sockaddr(local_sockaddr, local_socklen,
