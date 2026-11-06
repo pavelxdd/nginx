@@ -122,6 +122,8 @@ static ngx_int_t ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p,
     ngx_buf_t *buf);
 static ngx_int_t ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx, ngx_buf_t *b);
+static ngx_int_t ngx_http_proxy_v2_validate_closed_frame(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx);
 static ngx_int_t ngx_http_proxy_v2_skip_frame(ngx_http_proxy_v2_ctx_t *ctx,
     ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
@@ -1503,12 +1505,44 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
                 return NGX_HTTP_UPSTREAM_INVALID_HEADER;
             }
 
+            if (ctx->stream_id < ctx->id
+                && (ctx->stream_id & 1)
+                && (ctx->type == NGX_HTTP_V2_PRIORITY_FRAME
+                    || ctx->type == NGX_HTTP_V2_WINDOW_UPDATE_FRAME
+                    || ctx->type == NGX_HTTP_V2_RST_STREAM_FRAME))
+            {
+                /* RFC 9113, 5.1 and 6.3: ignore these closed-stream frames. */
+
+                if (ngx_http_proxy_v2_validate_closed_frame(r, ctx) != NGX_OK) {
+                    return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                }
+
+                ctx->state = ngx_http_proxy_v2_st_padding;
+                ctx->flags = 0;
+                continue;
+            }
+
             if (ctx->id && ctx->stream_id && ctx->stream_id != ctx->id) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                               "upstream sent frame for unknown stream %ui",
                               ctx->stream_id);
                 return NGX_HTTP_UPSTREAM_INVALID_HEADER;
             }
+        }
+
+        if (ctx->state == ngx_http_proxy_v2_st_padding) {
+            rc = ngx_http_proxy_v2_skip_frame(ctx, b);
+
+            if (rc == NGX_AGAIN) {
+                if (!ctx->parsing_headers) {
+                    b->pos = pos;
+                    b->last = b->pos;
+                }
+
+                return NGX_AGAIN;
+            }
+
+            continue;
         }
 
         /* frame payload */
@@ -2069,7 +2103,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             return NGX_ERROR;
         }
 
-        if (ctx->in) {
+        if (ctx->in || ctx->out) {
             ngx_post_event(u->peer.connection->write, &ngx_posted_events);
         }
 
@@ -2100,6 +2134,45 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
     }
 
     return NGX_DECLINED;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_validate_closed_frame(ngx_http_request_t *r,
+    ngx_http_proxy_v2_ctx_t *ctx)
+{
+    size_t       length;
+    const char  *type;
+
+    switch (ctx->type) {
+
+    case NGX_HTTP_V2_PRIORITY_FRAME:
+        type = "priority";
+        length = 5;
+        break;
+
+    case NGX_HTTP_V2_RST_STREAM_FRAME:
+        type = "rst stream";
+        length = 4;
+        break;
+
+    case NGX_HTTP_V2_WINDOW_UPDATE_FRAME:
+        type = "window update";
+        length = 4;
+        break;
+
+    default:
+        return NGX_ERROR;
+    }
+
+    if (ctx->rest != length) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upstream sent %s frame with invalid length: %uz",
+                      type, ctx->rest);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
 }
 
 
@@ -2186,6 +2259,21 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                               "upstream sent unexpected http2 frame: %d",
                               ctx->type);
                 return NGX_ERROR;
+            }
+
+            if (ctx->stream_id < ctx->id
+                && (ctx->stream_id & 1)
+                && (ctx->type == NGX_HTTP_V2_PRIORITY_FRAME
+                    || ctx->type == NGX_HTTP_V2_WINDOW_UPDATE_FRAME
+                    || ctx->type == NGX_HTTP_V2_RST_STREAM_FRAME))
+            {
+                if (ngx_http_proxy_v2_validate_closed_frame(r, ctx) != NGX_OK) {
+                    return NGX_ERROR;
+                }
+
+                ctx->state = ngx_http_proxy_v2_st_padding;
+                ctx->flags = 0;
+                continue;
             }
 
             if (ctx->type == NGX_HTTP_V2_DATA_FRAME) {
