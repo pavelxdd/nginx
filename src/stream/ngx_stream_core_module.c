@@ -1043,6 +1043,15 @@ ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        if (ngx_strcmp(value[i].data, "transparent") == 0) {
+            lsopt.transparent = 1;
+            lsopt.set = 1;
+            lsopt.bind = 1;
+            continue;
+        }
+#endif
+
 #if !(NGX_WIN32)
         if (ngx_strcmp(value[i].data, "udp") == 0) {
             lsopt.type = SOCK_DGRAM;

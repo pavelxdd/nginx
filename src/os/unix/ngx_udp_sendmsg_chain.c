@@ -378,6 +378,42 @@ ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg, struct sockaddr *local_sockaddr)
 
 #endif
 
+#if defined(IP_ORIGDSTADDR)
+
+    if (cmsg->cmsg_level == IPPROTO_IP
+        && cmsg->cmsg_type == IP_ORIGDSTADDR
+        && local_sockaddr->sa_family == AF_INET)
+    {
+        struct sockaddr_in  *sin4, *origdst4;
+
+        sin4 = (struct sockaddr_in *) local_sockaddr;
+        origdst4 = (struct sockaddr_in *) CMSG_DATA(cmsg);
+        sin4->sin_addr = origdst4->sin_addr;
+        sin4->sin_port = origdst4->sin_port;
+
+        return NGX_OK;
+    }
+
+#endif
+
+#if (NGX_HAVE_INET6) && defined(IPV6_ORIGDSTADDR)
+
+    if (cmsg->cmsg_level == IPPROTO_IPV6
+        && cmsg->cmsg_type == IPV6_ORIGDSTADDR
+        && local_sockaddr->sa_family == AF_INET6)
+    {
+        struct sockaddr_in6  *sin6a, *origdst6;
+
+        sin6a = (struct sockaddr_in6 *) local_sockaddr;
+        origdst6 = (struct sockaddr_in6 *) CMSG_DATA(cmsg);
+        sin6a->sin6_addr = origdst6->sin6_addr;
+        sin6a->sin6_port = origdst6->sin6_port;
+
+        return NGX_OK;
+    }
+
+#endif
+
     return NGX_DECLINED;
 }
 
