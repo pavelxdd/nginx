@@ -1201,6 +1201,54 @@ ngx_conf_set_num_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 char *
+ngx_conf_set_uint32_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    char  *p = conf;
+
+    u_char           digit;
+    size_t           i;
+    uint32_t         n;
+    ngx_uint_t      *np;
+    ngx_str_t       *value;
+    ngx_conf_post_t *post;
+
+
+    np = (ngx_uint_t *) (p + cmd->offset);
+    if (*np != NGX_CONF_UNSET_UINT) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    if (value[1].len == 0) {
+        return "invalid number";
+    }
+
+    n = 0;
+    for (i = 0; i < value[1].len; i++) {
+        if (value[1].data[i] < '0' || value[1].data[i] > '9') {
+            return "invalid number";
+        }
+
+        digit = value[1].data[i] - '0';
+        if (n > (NGX_MAX_UINT32_VALUE - digit) / 10) {
+            return "invalid number";
+        }
+
+        n = n * 10 + digit;
+    }
+
+    *np = n;
+
+    if (cmd->post) {
+        post = cmd->post;
+        return post->post_handler(cf, post, np);
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+char *
 ngx_conf_set_size_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     char  *p = conf;

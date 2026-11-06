@@ -211,6 +211,7 @@ typedef struct {
 
     ngx_http_upstream_local_t       *local;
     ngx_flag_t                       socket_keepalive;
+    ngx_uint_t                       socket_mark;
     size_t                           socket_rcvbuf;
     size_t                           socket_sndbuf;
 

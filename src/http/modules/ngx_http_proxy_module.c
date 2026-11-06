@@ -121,6 +121,8 @@ static char *ngx_http_proxy_cookie_flags(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_proxy_store(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_proxy_socket_mark(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 #if (NGX_HTTP_CACHE)
 static char *ngx_http_proxy_cache(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -303,6 +305,13 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
       ngx_conf_set_size_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_proxy_loc_conf_t, upstream.socket_sndbuf),
+      NULL },
+
+    { ngx_string("proxy_socket_mark"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_proxy_socket_mark,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, upstream.socket_mark),
       NULL },
 
     { ngx_string("proxy_connect_timeout"),
@@ -3585,6 +3594,7 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
 
     conf->upstream.local = NGX_CONF_UNSET_PTR;
     conf->upstream.socket_keepalive = NGX_CONF_UNSET;
+    conf->upstream.socket_mark = NGX_CONF_UNSET_UINT;
     conf->upstream.socket_rcvbuf = NGX_CONF_UNSET_SIZE;
     conf->upstream.socket_sndbuf = NGX_CONF_UNSET_SIZE;
 
@@ -3727,6 +3737,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_size_value(conf->upstream.socket_sndbuf,
                               prev->upstream.socket_sndbuf, 0);
+
+    ngx_conf_merge_uint_value(conf->upstream.socket_mark,
+                              prev->upstream.socket_mark, 0);
 
     ngx_conf_merge_msec_value(conf->upstream.connect_timeout,
                               prev->upstream.connect_timeout, 60000);
@@ -5251,6 +5264,36 @@ ngx_http_proxy_ssl_password_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 #endif
+
+
+static char *
+ngx_http_proxy_socket_mark(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+#if (NGX_HAVE_SO_MARK)
+    char             *rv;
+    ngx_uint_t       *mark;
+    ngx_core_conf_t  *ccf;
+
+    rv = ngx_conf_set_uint32_slot(cf, cmd, conf);
+    if (rv != NGX_CONF_OK) {
+        return rv;
+    }
+
+    mark = (ngx_uint_t *) ((char *) conf + cmd->offset);
+    if (*mark != 0) {
+        ccf = (ngx_core_conf_t *) ngx_get_conf(cf->cycle->conf_ctx,
+                                               ngx_core_module);
+        ccf->socket_mark = 1;
+    }
+
+    return NGX_CONF_OK;
+#else
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"proxy_socket_mark\" is not supported on this "
+                       "platform");
+    return NGX_CONF_ERROR;
+#endif
+}
 
 
 static char *
