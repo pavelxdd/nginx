@@ -76,6 +76,8 @@ static ngx_int_t ngx_stream_proxy_eval(ngx_stream_session_t *s,
 static ngx_int_t ngx_stream_proxy_set_local(ngx_stream_session_t *s,
     ngx_stream_upstream_t *u, ngx_stream_upstream_local_t *local);
 static void ngx_stream_proxy_connect(ngx_stream_session_t *s);
+static void ngx_stream_proxy_connect_peer(ngx_stream_session_t *s);
+static void ngx_stream_proxy_local_retry_handler(ngx_event_t *ev);
 static void ngx_stream_proxy_init_upstream(ngx_stream_session_t *s);
 static void ngx_stream_proxy_resolve_handler(ngx_resolver_ctx_t *ctx);
 static void ngx_stream_proxy_upstream_handler(ngx_event_t *ev);
@@ -775,8 +777,7 @@ ngx_stream_proxy_set_local(ngx_stream_session_t *s, ngx_stream_upstream_t *u,
 static void
 ngx_stream_proxy_connect(ngx_stream_session_t *s)
 {
-    ngx_int_t                     rc;
-    ngx_connection_t             *c, *pc;
+    ngx_connection_t             *c;
     ngx_stream_upstream_t        *u;
     ngx_stream_proxy_srv_conf_t  *pscf;
 
@@ -809,9 +810,47 @@ ngx_stream_proxy_connect(ngx_stream_session_t *s)
     u->state->first_byte_time = (ngx_msec_t) -1;
     u->state->response_time = (ngx_msec_t) -1;
 
-    rc = ngx_event_connect_peer(&u->peer);
+    u->local_retries = 0;
+
+    ngx_stream_proxy_connect_peer(s);
+}
+
+
+static void
+ngx_stream_proxy_connect_peer(ngx_stream_session_t *s)
+{
+    ngx_int_t                     rc;
+    ngx_connection_t             *c, *pc;
+    ngx_stream_upstream_t        *u;
+    ngx_stream_proxy_srv_conf_t  *pscf;
+
+    c = s->connection;
+    u = s->upstream;
+
+    pscf = ngx_stream_get_module_srv_conf(s, ngx_stream_proxy_module);
+
+    u->peer.local_retry = (u->local_retries < 5);
+
+    if (u->local_retries) {
+        rc = ngx_event_connect_selected_peer(&u->peer);
+
+    } else {
+        rc = ngx_event_connect_peer(&u->peer);
+    }
+
+    u->peer.local_retry = 0;
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0, "proxy connect: %i", rc);
+
+    if (u->peer.local_busy && u->local_retries < 5) {
+        u->local_retry.data = s;
+        u->local_retry.handler = ngx_stream_proxy_local_retry_handler;
+        u->local_retry.log = c->log;
+
+        ngx_add_timer(&u->local_retry, 1 << u->local_retries);
+        u->local_retries++;
+        return;
+    }
 
     if (rc == NGX_ERROR) {
         ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
@@ -869,6 +908,15 @@ ngx_stream_proxy_connect(ngx_stream_session_t *s)
     pc->write->handler = ngx_stream_proxy_connect_handler;
 
     ngx_add_timer(pc->write, pscf->connect_timeout);
+}
+
+
+static void
+ngx_stream_proxy_local_retry_handler(ngx_event_t *ev)
+{
+    ev->timedout = 0;
+
+    ngx_stream_proxy_connect_peer(ev->data);
 }
 
 
@@ -2330,6 +2378,10 @@ ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
 
     if (u == NULL) {
         goto noupstream;
+    }
+
+    if (u->local_retry.timer_set) {
+        ngx_del_timer(&u->local_retry);
     }
 
     if (u->resolved && u->resolved->ctx) {

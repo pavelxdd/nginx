@@ -43,6 +43,7 @@ static void ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
     ngx_event_t *ev);
 static void ngx_http_upstream_connect(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
+static void ngx_http_upstream_local_retry_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_upstream_reinit(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_upstream_send_request(ngx_http_request_t *r,
@@ -1609,6 +1610,8 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->state->connect_time = (ngx_msec_t) -1;
     u->state->header_time = (ngx_msec_t) -1;
 
+    u->local_retries = 0;
+
     rc = NGX_OK;
 
     if (ngx_http_upstream_peer_hook) {
@@ -1635,10 +1638,29 @@ ngx_http_upstream_peer_resume(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return;
     }
 
-    rc = ngx_event_connect_peer(&u->peer);
+    u->peer.local_retry = (u->local_retries < 5);
+
+    if (u->local_retries) {
+        rc = ngx_event_connect_selected_peer(&u->peer);
+
+    } else {
+        rc = ngx_event_connect_peer(&u->peer);
+    }
+
+    u->peer.local_retry = 0;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http upstream connect: %i", rc);
+
+    if (u->peer.local_busy && u->local_retries < 5) {
+        u->local_retry.data = r;
+        u->local_retry.handler = ngx_http_upstream_local_retry_handler;
+        u->local_retry.log = r->connection->log;
+
+        ngx_add_timer(&u->local_retry, 1 << u->local_retries);
+        u->local_retries++;
+        return;
+    }
 
     if (rc == NGX_ERROR) {
         ngx_http_upstream_finalize_request(r, u,
@@ -1780,6 +1802,24 @@ ngx_http_upstream_peer_resume(ngx_http_request_t *r, ngx_http_upstream_t *u,
 #endif
 
     ngx_http_upstream_send_request(r, u, 1);
+}
+
+
+static void
+ngx_http_upstream_local_retry_handler(ngx_event_t *ev)
+{
+    ngx_connection_t    *c;
+    ngx_http_request_t  *r;
+
+    r = ev->data;
+    c = r->connection;
+
+    ev->timedout = 0;
+    ngx_http_set_log_request(c->log, r);
+
+    ngx_http_upstream_peer_resume(r, r->upstream, NGX_OK);
+
+    ngx_http_run_posted_requests(c);
 }
 
 
@@ -4821,6 +4861,10 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "finalize http upstream request: %i", rc);
+
+    if (u->local_retry.timer_set) {
+        ngx_del_timer(&u->local_retry);
+    }
 
     if (u->cleanup == NULL) {
         /* the request was already finalized */

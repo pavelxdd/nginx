@@ -20,6 +20,22 @@ static ngx_int_t ngx_event_connect_set_transparent(ngx_peer_connection_t *pc,
 ngx_int_t
 ngx_event_connect_peer(ngx_peer_connection_t *pc)
 {
+    ngx_int_t  rc;
+
+    pc->local_busy = 0;
+
+    rc = pc->get(pc, pc->data);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    return ngx_event_connect_selected_peer(pc);
+}
+
+
+ngx_int_t
+ngx_event_connect_selected_peer(ngx_peer_connection_t *pc)
+{
     int                rc, type, value;
 #if (NGX_HAVE_IP_BIND_ADDRESS_NO_PORT || NGX_LINUX)
     in_port_t          port;
@@ -31,10 +47,7 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
     ngx_event_t       *rev, *wev;
     ngx_connection_t  *c;
 
-    rc = pc->get(pc, pc->data);
-    if (rc != NGX_OK) {
-        return rc;
-    }
+    pc->local_busy = 0;
 
     type = (pc->type ? pc->type : SOCK_STREAM);
 
@@ -163,7 +176,10 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
 
 #if (NGX_LINUX)
 
-        if (pc->type == SOCK_DGRAM && port != 0) {
+        if (port != 0
+            && (type == SOCK_DGRAM
+                || (type == SOCK_STREAM && pc->transparent)))
+        {
             int  reuse_addr = 1;
 
             if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
@@ -193,7 +209,17 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
 #endif
 
         if (bind(s, pc->local->sockaddr, pc->local->socklen) == -1) {
-            ngx_log_error(NGX_LOG_CRIT, pc->log, ngx_socket_errno,
+            err = ngx_socket_errno;
+            level = NGX_LOG_CRIT;
+
+#if (NGX_LINUX)
+            if (type == SOCK_STREAM && port != 0 && err == NGX_EADDRINUSE) {
+                pc->local_busy = 1;
+                level = pc->local_retry ? NGX_LOG_DEBUG : NGX_LOG_ERR;
+            }
+#endif
+
+            ngx_log_error(level, pc->log, err,
                           "bind(%V) failed", &pc->local->name);
 
             goto failed;
@@ -281,6 +307,16 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
             } else {
                 level = NGX_LOG_CRIT;
             }
+
+#if (NGX_LINUX)
+            if (type == SOCK_STREAM && pc->local
+                && ngx_inet_get_port(pc->local->sockaddr) != 0
+                && err == EADDRNOTAVAIL)
+            {
+                pc->local_busy = 1;
+                level = pc->local_retry ? NGX_LOG_DEBUG : NGX_LOG_ERR;
+            }
+#endif
 
             ngx_log_error(level, c->log, err, "connect() to %V failed",
                           pc->name);

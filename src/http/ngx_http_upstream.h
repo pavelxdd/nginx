@@ -351,6 +351,8 @@ struct ngx_http_upstream_s {
     ngx_http_upstream_handler_pt     write_event_handler;
 
     ngx_peer_connection_t            peer;
+    ngx_event_t                      local_retry;
+    ngx_uint_t                       local_retries;
 
     ngx_event_pipe_t                *pipe;
 
