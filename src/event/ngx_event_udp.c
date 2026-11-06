@@ -75,6 +75,8 @@ ngx_event_recvmsg(ngx_event_t *ev)
     static u_char       buffer[NGX_UDP_MAX_DATAGRAM_SIZE];
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
+    struct cmsghdr    *cmsg;
+    int                tos;
     u_char             msg_control[NGX_UDP_RECV_CMSG_SPACE];
 #endif
 
@@ -111,7 +113,12 @@ ngx_event_recvmsg(ngx_event_t *ev)
         msg.msg_iovlen = 1;
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
-        if (ls->wildcard) {
+        if (ls->wildcard || ls->sockaddr->sa_family == AF_INET
+#if (NGX_HAVE_INET6)
+            || ls->sockaddr->sa_family == AF_INET6
+#endif
+           )
+        {
             msg.msg_control = &msg_control;
             msg.msg_controllen = sizeof(msg_control);
 
@@ -185,6 +192,32 @@ ngx_event_recvmsg(ngx_event_t *ev)
 
 #endif
 
+        ngx_memzero(&buf, sizeof(ngx_buf_t));
+
+#if (NGX_HAVE_ADDRINFO_CMSG)
+        for (cmsg = CMSG_FIRSTHDR(&msg);
+             cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msg, cmsg))
+        {
+            if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS
+                && cmsg->cmsg_len == CMSG_LEN(sizeof(u_char)))
+            {
+                buf.udp_tos = *(u_char *) CMSG_DATA(cmsg);
+                buf.udp_tos_set = 1;
+            }
+#if (NGX_HAVE_INET6)
+            if (cmsg->cmsg_level == IPPROTO_IPV6
+                && cmsg->cmsg_type == IPV6_TCLASS
+                && cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
+            {
+                ngx_memcpy(&tos, CMSG_DATA(cmsg), sizeof(int));
+                buf.udp_tos = (u_char) tos;
+                buf.udp_tos_set = 1;
+            }
+#endif
+        }
+#endif
+
         if (ngx_udp_session_key(ls, sockaddr, socklen,
                                 local_sockaddr, local_socklen,
                                 buffer, n, key_storage, sizeof(key_storage),
@@ -212,8 +245,6 @@ ngx_event_recvmsg(ngx_event_t *ev)
                 c->log->handler = handler;
             }
 #endif
-
-            ngx_memzero(&buf, sizeof(ngx_buf_t));
 
             buf.start = buffer;
             buf.pos = buffer;
@@ -330,6 +361,8 @@ ngx_event_recvmsg(ngx_event_t *ev)
         }
 
         c->buffer->last = ngx_cpymem(c->buffer->last, buffer, n);
+        c->buffer->udp_tos = buf.udp_tos;
+        c->buffer->udp_tos_set = buf.udp_tos_set;
 
         rev = c->read;
         wev = c->write;
@@ -455,6 +488,10 @@ ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf, size_t size)
     }
 
     ngx_memcpy(buf, b->pos, n);
+    c->buffer->udp_tos = b->udp_tos;
+    c->buffer->udp_tos_set = b->udp_tos_set;
+    c->buffer->sfc_udp_dscp = b->sfc_udp_dscp;
+    c->buffer->sfc_udp_dscp_set = b->sfc_udp_dscp_set;
 
     return n;
 }

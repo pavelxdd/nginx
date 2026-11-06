@@ -12,7 +12,8 @@
 
 static ngx_chain_t *ngx_udp_output_chain_to_iovec(ngx_iovec_t *vec,
     ngx_chain_t *in, ngx_log_t *log);
-static ssize_t ngx_sendmsg_vec(ngx_connection_t *c, ngx_iovec_t *vec);
+static ssize_t ngx_sendmsg_vec(ngx_connection_t *c, ngx_iovec_t *vec,
+    ngx_buf_t *packet);
 
 
 ngx_chain_t *
@@ -20,7 +21,8 @@ ngx_udp_unix_sendmsg_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 {
     ssize_t        n;
     off_t          send;
-    ngx_chain_t   *cl;
+    ngx_chain_t   *cl, *part;
+    ngx_buf_t     *packet;
     ngx_event_t   *wev;
     ngx_iovec_t    vec;
     struct iovec   iovs[NGX_IOVS_PREALLOCATE];
@@ -88,7 +90,15 @@ ngx_udp_unix_sendmsg_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 
         send += vec.size;
 
-        n = ngx_sendmsg_vec(c, &vec);
+        packet = NULL;
+        for (part = in; part != cl; part = part->next) {
+            if (part->buf->sfc_udp_dscp_set) {
+                packet = part->buf;
+                break;
+            }
+        }
+
+        n = ngx_sendmsg_vec(c, &vec, packet);
 
         if (n == NGX_ERROR) {
             return NGX_CHAIN_ERROR;
@@ -204,13 +214,16 @@ ngx_udp_output_chain_to_iovec(ngx_iovec_t *vec, ngx_chain_t *in, ngx_log_t *log)
 
 
 static ssize_t
-ngx_sendmsg_vec(ngx_connection_t *c, ngx_iovec_t *vec)
+ngx_sendmsg_vec(ngx_connection_t *c, ngx_iovec_t *vec, ngx_buf_t *packet)
 {
     struct msghdr    msg;
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
     struct cmsghdr  *cmsg;
-    u_char           msg_control[CMSG_SPACE(sizeof(ngx_addrinfo_t))];
+    int              tos;
+    size_t           address_len;
+    u_char           msg_control[CMSG_SPACE(sizeof(ngx_addrinfo_t))
+                                 + CMSG_SPACE(sizeof(int))];
 #endif
 
     ngx_memzero(&msg, sizeof(struct msghdr));
@@ -233,6 +246,35 @@ ngx_sendmsg_vec(ngx_connection_t *c, ngx_iovec_t *vec)
         cmsg = CMSG_FIRSTHDR(&msg);
 
         msg.msg_controllen = ngx_set_srcaddr_cmsg(cmsg, c->local_sockaddr);
+    }
+
+    if (packet && ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (packet
+        && (c->local_sockaddr->sa_family == AF_INET
+#if (NGX_HAVE_INET6)
+            || c->local_sockaddr->sa_family == AF_INET6
+#endif
+           ))
+    {
+        address_len = msg.msg_controllen;
+        msg.msg_control = msg_control;
+        msg.msg_controllen = address_len + CMSG_SPACE(sizeof(int));
+        cmsg = (struct cmsghdr *) (msg_control + address_len);
+        ngx_memzero(cmsg, CMSG_SPACE(sizeof(int)));
+        cmsg->cmsg_level = IPPROTO_IP;
+        cmsg->cmsg_type = IP_TOS;
+#if (NGX_HAVE_INET6)
+        if (c->local_sockaddr->sa_family == AF_INET6) {
+            cmsg->cmsg_level = IPPROTO_IPV6;
+            cmsg->cmsg_type = IPV6_TCLASS;
+        }
+#endif
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        tos = packet->sfc_udp_dscp << 2;
+        ngx_memcpy(CMSG_DATA(cmsg), &tos, sizeof(int));
     }
 #endif
 

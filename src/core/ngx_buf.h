@@ -28,6 +28,10 @@ struct ngx_buf_s {
     ngx_buf_tag_t    tag;
     ngx_file_t      *file;
     ngx_buf_t       *shadow;
+    u_char           udp_tos;
+    u_char           sfc_udp_dscp;
+    unsigned         udp_tos_set:1;
+    unsigned         sfc_udp_dscp_set:1;
 
 
     /* the buf's content could be changed */

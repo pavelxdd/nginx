@@ -2045,6 +2045,30 @@ ngx_configure_listening_sockets(ngx_cycle_t *cycle)
 
 #endif
 
+        if (ls[i].type == SOCK_DGRAM) {
+            value = 1;
+
+            if (ls[i].sockaddr->sa_family == AF_INET
+                && setsockopt(ls[i].fd, IPPROTO_IP, IP_RECVTOS,
+                              (const void *) &value, sizeof(int)) == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              "setsockopt(IP_RECVTOS) for %V failed",
+                              &ls[i].addr_text);
+            }
+
+#if (NGX_HAVE_INET6)
+            if (ls[i].sockaddr->sa_family == AF_INET6
+                && setsockopt(ls[i].fd, IPPROTO_IPV6, IPV6_RECVTCLASS,
+                              (const void *) &value, sizeof(int)) == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              "setsockopt(IPV6_RECVTCLASS) for %V failed",
+                              &ls[i].addr_text);
+            }
+#endif
+        }
+
 #if (NGX_HAVE_IP_MTU_DISCOVER)
 
         if (ls[i].quic && ls[i].sockaddr->sa_family == AF_INET) {
