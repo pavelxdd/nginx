@@ -75,8 +75,14 @@ typedef struct {
     int                            tcp_keepcnt;
 #endif
 
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+    unsigned                       transparent;
+#endif
 #if (NGX_HAVE_DEFERRED_ACCEPT && defined SO_ACCEPTFILTER)
     char                          *accept_filter;
+#endif
+#if (NGX_HAVE_BINDTODEVICE)
+    const char                    *device;
 #endif
 } ngx_stream_listen_opt_t;
 

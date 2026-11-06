@@ -161,6 +161,20 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
 
 #endif
 
+#if (NGX_HAVE_BINDTODEVICE)
+
+        if (pc->device) {
+            if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                           pc->device, ngx_strlen(pc->device) + 1) == -1) {
+                ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
+                              "setsockopt(SO_BINDTODEVICE, %s) failed",
+                              pc->device);
+                goto failed;
+            }
+        }
+
+#endif
+
         if (bind(s, pc->local->sockaddr, pc->local->socklen) == -1) {
             ngx_log_error(NGX_LOG_CRIT, pc->log, ngx_socket_errno,
                           "bind(%V) failed", &pc->local->name);
