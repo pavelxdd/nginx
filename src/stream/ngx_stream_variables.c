@@ -23,6 +23,8 @@ static ngx_int_t ngx_stream_variable_proxy_protocol_addr(
     ngx_stream_session_t *s, ngx_stream_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_stream_variable_proxy_protocol_port(
     ngx_stream_session_t *s, ngx_stream_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_stream_variable_proxy_protocol_addr_port(
+    ngx_stream_session_t *s, ngx_stream_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_stream_variable_proxy_protocol_tlv(
     ngx_stream_session_t *s, ngx_stream_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_stream_variable_server_addr(ngx_stream_session_t *s,
@@ -82,6 +84,14 @@ static ngx_stream_variable_t  ngx_stream_core_variables[] = {
     { ngx_string("proxy_protocol_server_port"), NULL,
       ngx_stream_variable_proxy_protocol_port,
       offsetof(ngx_proxy_protocol_t, dst_port), 0, 0 },
+
+    { ngx_string("proxy_protocol_addr_port"), NULL,
+      ngx_stream_variable_proxy_protocol_addr_port,
+      0, 0, 0 },
+
+    { ngx_string("proxy_protocol_server_addr_port"), NULL,
+      ngx_stream_variable_proxy_protocol_addr_port,
+      1, 0, 0 },
 
     { ngx_string("proxy_protocol_tlv_"), NULL,
       ngx_stream_variable_proxy_protocol_tlv,
@@ -627,6 +637,59 @@ ngx_stream_variable_proxy_protocol_port(ngx_stream_session_t *s,
     if (port > 0 && port < 65536) {
         v->len = ngx_sprintf(v->data, "%ui", port) - v->data;
     }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_stream_variable_proxy_protocol_addr_port(ngx_stream_session_t *s,
+    ngx_stream_variable_value_t *v, uintptr_t data)
+{
+    ngx_str_t             *addr;
+    ngx_uint_t             port, ipv6;
+    ngx_proxy_protocol_t  *pp;
+
+    pp = s->connection->proxy_protocol;
+    if (pp == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    if (data == 0) {
+        addr = &pp->src_addr;
+        port = pp->src_port;
+    } else {
+        addr = &pp->dst_addr;
+        port = pp->dst_port;
+    }
+
+    if (addr->len == 0 || port == 0 || port >= 65536) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+#if (NGX_HAVE_INET6)
+    ipv6 = (pp->family == AF_INET6);
+#else
+    ipv6 = 0;
+#endif
+
+    v->data = ngx_pnalloc(s->connection->pool,
+                          addr->len + sizeof("[]:65535") - 1);
+    if (v->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ipv6) {
+        v->len = ngx_sprintf(v->data, "[%V]:%ui", addr, port) - v->data;
+    } else {
+        v->len = ngx_sprintf(v->data, "%V:%ui", addr, port) - v->data;
+    }
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
 
     return NGX_OK;
 }
