@@ -66,6 +66,10 @@ struct ngx_peer_connection_s {
     ngx_str_t                       *sid;
 #endif
 
+#if (NGX_HAVE_BINDTODEVICE)
+    const char                      *device;
+#endif
+
     unsigned                         cached:1;
     unsigned                         transparent:1;
     unsigned                         so_keepalive:1;

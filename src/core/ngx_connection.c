@@ -8,6 +8,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_event.h>
+#if (NGX_HAVE_BINDTODEVICE)
+#include <net/if.h>
+#endif
 
 
 ngx_os_io_t  ngx_io;
@@ -138,7 +141,8 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
     ngx_uint_t                 i;
     ngx_listening_t           *ls;
     socklen_t                  olen;
-#if (NGX_HAVE_DEFERRED_ACCEPT || NGX_HAVE_TCP_FASTOPEN)
+#if (NGX_HAVE_DEFERRED_ACCEPT || NGX_HAVE_TCP_FASTOPEN \
+     || NGX_HAVE_BINDTODEVICE)
     ngx_err_t                  err;
 #endif
 #if (NGX_HAVE_DEFERRED_ACCEPT && defined SO_ACCEPTFILTER)
@@ -149,6 +153,9 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
 #endif
 #if (NGX_HAVE_REUSEPORT)
     int                        reuseport;
+#endif
+#if (NGX_HAVE_BINDTODEVICE)
+    char                       device[IFNAMSIZ];
 #endif
 
     ls = cycle->listening.elts;
@@ -416,6 +423,39 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
 
         ls[i].deferred_accept = 1;
 #endif
+
+#if (NGX_HAVE_BINDTODEVICE)
+
+        ngx_memzero(device, sizeof(device));
+        olen = sizeof(device);
+
+        if (getsockopt(ls[i].fd, SOL_SOCKET, SO_BINDTODEVICE, device, &olen)
+            == -1)
+        {
+            err = ngx_socket_errno;
+
+            if (err == NGX_EINVAL) {
+                continue;
+            }
+
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, err,
+                          "getsockopt(SO_BINDTODEVICE) for %V failed",
+                          &ls[i].addr_text);
+            continue;
+        }
+
+        if (device[0] == '\0') {
+            continue;
+        }
+
+        ls[i].device = ngx_palloc(cycle->pool, IFNAMSIZ);
+        if (ls[i].device == NULL) {
+            return NGX_ERROR;
+        }
+
+        (void) ngx_cpystrn((u_char *)ls[i].device,
+                           (u_char *)device, IFNAMSIZ);
+#endif
     }
 
     return NGX_OK;
@@ -426,6 +466,9 @@ ngx_int_t
 ngx_open_listening_sockets(ngx_cycle_t *cycle)
 {
     int               reuseaddr;
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+    int               value;
+#endif
     ngx_uint_t        i, tries, failed;
     ngx_err_t         err;
     ngx_log_t        *log;
@@ -518,6 +561,87 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
                               ngx_socket_n " %V failed", &ls[i].addr_text);
                 return NGX_ERROR;
             }
+
+#if (NGX_HAVE_BINDTODEVICE)
+            if (ls[i].device) {
+                if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                               ls[i].device, ngx_strlen(ls[i].device) + 1) == -1)
+                {
+                    ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                  "setsockopt(SO_BINDTODEVICE, %s) %V failed",
+                                  ls[i].device, &ls[i].addr_text);
+
+                    if (ngx_close_socket(s) == -1) {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      ngx_close_socket_n " %V failed",
+                                      &ls[i].addr_text);
+                    }
+
+                    return NGX_ERROR;
+                }
+            }
+#endif
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+            if (ls[i].transparent) {
+                value = ls[i].transparent;
+
+                switch (ls[i].sockaddr->sa_family) {
+#if (defined IP_TRANSPARENT)
+                case AF_INET:
+                    if (setsockopt(s, SOL_IP, IP_TRANSPARENT,
+                                   (const void *)&value, sizeof(int)) == -1)
+                    {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      "setsockopt(IP_TRANSPARENT, %d) "
+                                      "%V failed", value, &ls[i].addr_text);
+
+                        if (ngx_close_socket(s) == -1) {
+                            ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                          ngx_close_socket_n " %V failed",
+                                          &ls[i].addr_text);
+                        }
+
+                        return NGX_ERROR;
+                    }
+                    break;
+#endif
+
+#if (NGX_HAVE_INET6 && defined IPV6_TRANSPARENT)
+                case AF_INET6:
+                    if (setsockopt(s, SOL_IPV6, IPV6_TRANSPARENT,
+                                   (const void *)&value, sizeof(int)) == -1)
+                    {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      "setsockopt(IPV6_TRANSPARENT, %d) "
+                                      "%V failed", value, &ls[i].addr_text);
+
+                        if (ngx_close_socket(s) == -1) {
+                            ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                          ngx_close_socket_n " %V failed",
+                                          &ls[i].addr_text);
+                        }
+
+                        return NGX_ERROR;
+                    }
+                    break;
+#endif
+
+                default:
+                    ngx_log_error(NGX_LOG_EMERG, log, 0,
+                                  "transparent proxying is not supported for %V",
+                                  &ls[i].addr_text);
+
+                    if (ngx_close_socket(s) == -1) {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      ngx_close_socket_n " %V failed",
+                                      &ls[i].addr_text);
+                    }
+
+                    return NGX_ERROR;
+                }
+            }
+#endif
 
             if (ls[i].type != SOCK_DGRAM || !ngx_test_config) {
 

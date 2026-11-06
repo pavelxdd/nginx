@@ -159,6 +159,9 @@ typedef struct {
 #if (NGX_HAVE_TRANSPARENT_PROXY)
     ngx_uint_t                       transparent; /* unsigned  transparent:1; */
 #endif
+#if (NGX_HAVE_BINDTODEVICE)
+    const char                      *device;
+#endif
 } ngx_http_upstream_local_t;
 
 

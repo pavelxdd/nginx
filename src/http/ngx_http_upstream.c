@@ -8,6 +8,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#if (NGX_HAVE_BINDTODEVICE)
+#include <net/if.h>
+#endif
 
 
 #if (NGX_HTTP_CACHE)
@@ -7021,23 +7024,54 @@ ngx_http_upstream_bind_set_slot(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     if (cf->args->nelts > 2) {
-        if (ngx_strcmp(value[2].data, "transparent") == 0) {
+        ngx_uint_t  i;
+
+        for (i = 2; i < cf->args->nelts; i++) {
+            if (ngx_strcmp(value[i].data, "transparent") == 0) {
 #if (NGX_HAVE_TRANSPARENT_PROXY)
-            ngx_core_conf_t  *ccf;
+                ngx_core_conf_t  *ccf;
 
-            ccf = (ngx_core_conf_t *) ngx_get_conf(cf->cycle->conf_ctx,
-                                                   ngx_core_module);
+                ccf = (ngx_core_conf_t *) ngx_get_conf(cf->cycle->conf_ctx,
+                                                       ngx_core_module);
 
-            ccf->transparent = 1;
-            local->transparent = 1;
+                ccf->transparent = 1;
+                local->transparent = 1;
 #else
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "transparent proxying is not supported "
-                               "on this platform, ignored");
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "transparent proxying is not supported "
+                                   "on this platform");
+                return NGX_CONF_ERROR;
 #endif
-        } else {
+                continue;
+            }
+
+            if (ngx_strncmp(value[i].data, "device=", 7) == 0) {
+                if (value[i].len == 7) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "empty device name in \"%V\"", &value[i]);
+                    return NGX_CONF_ERROR;
+                }
+
+#if (NGX_HAVE_BINDTODEVICE)
+                if (value[i].len - 7 >= IFNAMSIZ) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "too long device name in \"%V\"", &value[i]);
+                    return NGX_CONF_ERROR;
+                }
+
+                local->device = (const char *)&value[i].data[7];
+                continue;
+#else
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "bind to device \"%V\" is not supported "
+                                   "on this platform",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+#endif
+            }
+
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid parameter \"%V\"", &value[2]);
+                               "invalid parameter \"%V\"", &value[i]);
             return NGX_CONF_ERROR;
         }
     }
@@ -7061,6 +7095,10 @@ ngx_http_upstream_set_local(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
 #if (NGX_HAVE_TRANSPARENT_PROXY)
     u->peer.transparent = local->transparent;
+#endif
+
+#if (NGX_HAVE_BINDTODEVICE)
+    u->peer.device = local->device;
 #endif
 
     if (local->value == NULL) {

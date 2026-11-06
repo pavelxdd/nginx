@@ -8,6 +8,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_stream.h>
+#if (NGX_HAVE_BINDTODEVICE)
+#include <net/if.h>
+#endif
 
 
 static ngx_uint_t ngx_stream_preread_can_peek(ngx_connection_t *c);
@@ -1050,6 +1053,33 @@ ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (ngx_strcmp(value[i].data, "bind") == 0) {
             lsopt.set = 1;
             lsopt.bind = 1;
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "device=", 7) == 0) {
+            if (value[i].len == 7) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "empty device name in \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+#if (NGX_HAVE_BINDTODEVICE)
+            if (value[i].len - 7 >= IFNAMSIZ) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "too long device name in \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            lsopt.device = (const char *)&value[i].data[7];
+            lsopt.set = 1;
+            lsopt.bind = 1;
+#else
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "bind to device \"%V\" is not supported "
+                               "on this platform",
+                               &value[i]);
+            return NGX_CONF_ERROR;
+#endif
             continue;
         }
 
