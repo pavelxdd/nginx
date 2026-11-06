@@ -125,6 +125,8 @@ typedef struct {
 
 typedef struct {
     ngx_peer_connection_t              peer;
+    ngx_event_t                        local_retry;
+    ngx_uint_t                         local_retries;
 
     ngx_buf_t                          downstream_buf;
     ngx_buf_t                          upstream_buf;

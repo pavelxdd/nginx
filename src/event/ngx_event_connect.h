@@ -76,6 +76,8 @@ struct ngx_peer_connection_s {
     unsigned                         transparent:1;
     unsigned                         so_keepalive:1;
     unsigned                         down:1;
+    unsigned                         local_busy:1;
+    unsigned                         local_retry:1;
 
                                      /* ngx_connection_log_error_e */
     unsigned                         log_error:2;
@@ -86,6 +88,7 @@ struct ngx_peer_connection_s {
 
 
 ngx_int_t ngx_event_connect_peer(ngx_peer_connection_t *pc);
+ngx_int_t ngx_event_connect_selected_peer(ngx_peer_connection_t *pc);
 ngx_int_t ngx_event_get_peer(ngx_peer_connection_t *pc, void *data);
 
 
