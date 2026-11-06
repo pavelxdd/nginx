@@ -3788,7 +3788,7 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
     size_t                     size;
     ssize_t                    n;
     ngx_buf_t                 *b;
-    ngx_uint_t                 flags;
+    ngx_uint_t                 flags, failed;
     ngx_connection_t          *c, *downstream, *upstream, *dst, *src;
     ngx_http_upstream_t       *u;
     ngx_http_core_loc_conf_t  *clcf;
@@ -3801,6 +3801,12 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
 
     downstream = c;
     upstream = u->peer.connection;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    failed = downstream->error || downstream->read->error
+             || downstream->write->error || upstream->error
+             || upstream->read->error || upstream->write->error;
 
     if (downstream->write->timedout) {
         c->timedout = 1;
@@ -3848,7 +3854,7 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
 
     for ( ;; ) {
 
-        if (do_write) {
+        if (do_write && !dst->error && !dst->write->error) {
 
             size = b->last - b->pos;
 
@@ -3857,8 +3863,9 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
                 n = dst->send(dst, b->pos, size);
 
                 if (n == NGX_ERROR) {
-                    ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
-                    return;
+                    dst->write->error = 1;
+                    failed = 1;
+                    break;
                 }
 
                 if (n > 0) {
@@ -3874,11 +3881,21 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
 
         size = b->end - b->last;
 
-        if (size && src->read->ready) {
+        if (size && src->read->ready && !failed) {
 
             n = src->recv(src, b->last, size);
 
-            if (n == NGX_AGAIN || n == 0) {
+            if (n == NGX_AGAIN) {
+                break;
+            }
+
+            if (n == 0) {
+                if (ngx_connection_test_half_close(src) != NGX_OK) {
+                    src->error = 1;
+                    src->read->error = 1;
+                    failed = 1;
+                }
+
                 break;
             }
 
@@ -3894,24 +3911,48 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
             }
 
             if (n == NGX_ERROR) {
-                src->read->eof = 1;
+                src->error = 1;
+                src->read->error = 1;
+                failed = 1;
             }
         }
 
         break;
     }
 
-    if ((upstream->read->eof && u->buffer.pos == u->buffer.last)
-        || (downstream->read->eof && u->from_client.pos == u->from_client.last)
-        || (downstream->read->eof && upstream->read->eof))
+    if (failed) {
+        if ((downstream->error || downstream->write->error
+             || (u->buffer.pos == u->buffer.last && !downstream->buffered))
+            && (upstream->error || upstream->write->error
+                || (u->from_client.pos == u->from_client.last
+                    && r->header_in->pos == r->header_in->last
+                    && !upstream->buffered)))
+        {
+            flags = ngx_connection_set_error_close(downstream,
+                                                   clcf->send_timeout)
+                    == NGX_AGAIN;
+            flags |= ngx_connection_set_error_close(upstream,
+                                                    u->conf->send_timeout)
+                     == NGX_AGAIN;
+
+            if (flags) {
+                return;
+            }
+
+            ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
+            return;
+        }
+
+    } else if ((upstream->read->eof && u->buffer.pos == u->buffer.last)
+               || (downstream->read->eof
+                   && u->from_client.pos == u->from_client.last)
+               || (downstream->read->eof && upstream->read->eof))
     {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "http upstream upgraded done");
         ngx_http_upstream_finalize_request(r, u, 0);
         return;
     }
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
     if (ngx_handle_write_event(upstream->write, u->conf->send_lowat)
         != NGX_OK)
