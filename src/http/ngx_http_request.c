@@ -3083,9 +3083,19 @@ ngx_http_set_write_handler(ngx_http_request_t *r)
 
     r->http_state = NGX_HTTP_WRITING_REQUEST_STATE;
 
-    r->read_event_handler = r->discard_body ?
-                                ngx_http_discarded_request_body_handler:
-                                ngx_http_test_reading;
+    if (r->discard_body) {
+        r->read_event_handler = ngx_http_discarded_request_body_handler;
+
+    } else if (r->upstream
+               && r->upstream->conf
+               && r->upstream->conf->ignore_client_abort)
+    {
+        r->read_event_handler = ngx_http_block_reading;
+
+    } else {
+        r->read_event_handler = ngx_http_test_reading;
+    }
+
     r->write_event_handler = ngx_http_writer;
 
     wev = r->connection->write;
