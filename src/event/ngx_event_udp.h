@@ -45,6 +45,12 @@ typedef union {
 #if (NGX_HAVE_INET6 && NGX_HAVE_IPV6_RECVPKTINFO)
     struct in6_pktinfo    pkt6;
 #endif
+#if defined(IP_ORIGDSTADDR)
+    struct sockaddr_in    origdst;
+#endif
+#if (NGX_HAVE_INET6) && defined(IPV6_ORIGDSTADDR)
+    struct sockaddr_in6   origdst6;
+#endif
 } ngx_addrinfo_t;
 
 size_t ngx_set_srcaddr_cmsg(struct cmsghdr *cmsg,

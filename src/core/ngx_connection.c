@@ -1112,6 +1112,9 @@ ngx_configure_listening_sockets(ngx_cycle_t *cycle)
 
         if (ls[i].wildcard
             && ls[i].type == SOCK_DGRAM
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+            && !ls[i].transparent
+#endif
             && ls[i].sockaddr->sa_family == AF_INET)
         {
             value = 1;
@@ -1131,6 +1134,9 @@ ngx_configure_listening_sockets(ngx_cycle_t *cycle)
 
         if (ls[i].wildcard
             && ls[i].type == SOCK_DGRAM
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+            && !ls[i].transparent
+#endif
             && ls[i].sockaddr->sa_family == AF_INET)
         {
             value = 1;
@@ -1152,6 +1158,9 @@ ngx_configure_listening_sockets(ngx_cycle_t *cycle)
 
         if (ls[i].wildcard
             && ls[i].type == SOCK_DGRAM
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+            && !ls[i].transparent
+#endif
             && ls[i].sockaddr->sa_family == AF_INET6)
         {
             value = 1;
@@ -1162,6 +1171,51 @@ ngx_configure_listening_sockets(ngx_cycle_t *cycle)
             {
                 ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
                               "setsockopt(IPV6_RECVPKTINFO) "
+                              "for %V failed, ignored",
+                              &ls[i].addr_text);
+            }
+        }
+
+#endif
+
+#if (NGX_HAVE_TRANSPARENT_PROXY) && defined(IP_RECVORIGDSTADDR)
+
+        if (ls[i].wildcard
+            && ls[i].type == SOCK_DGRAM
+            && ls[i].transparent
+            && ls[i].sockaddr->sa_family == AF_INET)
+        {
+            value = 1;
+
+            if (setsockopt(ls[i].fd, IPPROTO_IP, IP_RECVORIGDSTADDR,
+                           (const void *) &value, sizeof(int))
+                == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              "setsockopt(IP_RECVORIGDSTADDR) "
+                              "for %V failed, ignored",
+                              &ls[i].addr_text);
+            }
+        }
+
+#endif
+
+#if (NGX_HAVE_TRANSPARENT_PROXY) && (NGX_HAVE_INET6) \
+    && defined(IPV6_RECVORIGDSTADDR)
+
+        if (ls[i].wildcard
+            && ls[i].type == SOCK_DGRAM
+            && ls[i].transparent
+            && ls[i].sockaddr->sa_family == AF_INET6)
+        {
+            value = 1;
+
+            if (setsockopt(ls[i].fd, IPPROTO_IPV6, IPV6_RECVORIGDSTADDR,
+                           (const void *) &value, sizeof(int))
+                == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              "setsockopt(IPV6_RECVORIGDSTADDR) "
                               "for %V failed, ignored",
                               &ls[i].addr_text);
             }
