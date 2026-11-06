@@ -551,6 +551,7 @@ struct ngx_http_request_s {
     unsigned                          internal:1;
     unsigned                          error_page:1;
     unsigned                          filter_finalize:1;
+    unsigned                          upstream_body_error:1;
     unsigned                          post_action:1;
     unsigned                          request_complete:1;
     unsigned                          request_output:1;

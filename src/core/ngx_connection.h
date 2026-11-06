@@ -181,6 +181,7 @@ struct ngx_connection_s {
     ngx_atomic_uint_t   number;
 
     ngx_msec_t          start_time;
+    ngx_msec_t          error_close_timeout;
     ngx_uint_t          requests;
 
     unsigned            buffered:8;
@@ -189,6 +190,7 @@ struct ngx_connection_s {
 
     unsigned            timedout:1;
     unsigned            error:1;
+    unsigned            error_close:1;
     unsigned            destroyed:1;
     unsigned            pipeline:1;
 

@@ -41,6 +41,7 @@ static void ngx_http_request_handler(ngx_event_t *ev);
 static void ngx_http_terminate_request(ngx_http_request_t *r, ngx_int_t rc);
 static void ngx_http_terminate_handler(ngx_http_request_t *r);
 static void ngx_http_finalize_connection(ngx_http_request_t *r);
+static void ngx_http_error_close_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_set_write_handler(ngx_http_request_t *r);
 static void ngx_http_writer(ngx_http_request_t *r);
 static void ngx_http_request_finalizer(ngx_http_request_t *r);
@@ -3034,7 +3035,7 @@ ngx_http_finalize_connection(ngx_http_request_t *r)
 
     r = r->main;
 
-    if (r->connection->read->eof) {
+    if (r->connection->read->eof || r->connection->error_close) {
         ngx_http_close_request(r, 0);
         return;
     }
@@ -4101,12 +4102,50 @@ ngx_http_log_request(ngx_http_request_t *r)
 
 
 void
+ngx_http_set_error_close(ngx_connection_t *c, ngx_msec_t timeout)
+{
+    if (c->error_close) {
+        return;
+    }
+
+    c->error_close = 1;
+    c->error_close_timeout = timeout;
+
+    if (c->reusable) {
+        c->close = 1;
+        ngx_post_event(c->read, &ngx_posted_events);
+    }
+}
+
+
+static void
+ngx_http_error_close_handler(ngx_event_t *ev)
+{
+    ngx_http_close_connection(ev->data);
+}
+
+
+void
 ngx_http_close_connection(ngx_connection_t *c)
 {
     ngx_pool_t  *pool;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "close http connection: %d", c->fd);
+
+    if (c->error_close) {
+        ngx_reusable_connection(c, 0);
+        if (c->lingering == NULL) {
+            c->read->handler = ngx_http_error_close_handler;
+            c->write->handler = ngx_http_error_close_handler;
+        }
+
+        if (ngx_connection_set_error_close(c, c->error_close_timeout)
+            == NGX_AGAIN)
+        {
+            return;
+        }
+    }
 
 #if (NGX_HTTP_SSL)
 
