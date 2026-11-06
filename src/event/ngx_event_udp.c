@@ -12,6 +12,7 @@
 
 #define NGX_UDP_MAX_DATAGRAM_SIZE        65843
 #define NGX_UDP_SESSION_KEY_BUFFER_SIZE  64
+#define NGX_UDP_DROP_LOG_INTERVAL        5000
 
 
 #if !(NGX_WIN32)
@@ -29,6 +30,9 @@ void ngx_stream_sfc_loop_udp_finalize(ngx_connection_t *c, ngx_int_t rc);
 static void ngx_close_accepted_udp_connection(ngx_connection_t *c);
 static ssize_t ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf,
     size_t size);
+static void ngx_udp_record_drop(size_t size, ngx_uint_t unread);
+static void ngx_udp_drop_timer_handler(ngx_event_t *ev);
+static void ngx_udp_log_drops(ngx_log_t *log, ngx_uint_t final);
 static ngx_int_t ngx_udp_session_key(ngx_listening_t *ls,
     struct sockaddr *sockaddr, socklen_t socklen,
     struct sockaddr *local_sockaddr, socklen_t local_socklen,
@@ -40,6 +44,14 @@ static ngx_connection_t *ngx_lookup_udp_connection(ngx_listening_t *ls,
     struct sockaddr *sockaddr, socklen_t socklen,
     struct sockaddr *local_sockaddr, socklen_t local_socklen,
     ngx_str_t *key);
+
+
+static uint64_t     ngx_udp_oversized_packets;
+static uint64_t     ngx_udp_oversized_bytes;
+static uint64_t     ngx_udp_unread_packets;
+static uint64_t     ngx_udp_unread_bytes;
+static ngx_event_t  ngx_udp_drop_event;
+
 
 void
 ngx_event_recvmsg(ngx_event_t *ev)
@@ -233,6 +245,10 @@ ngx_event_recvmsg(ngx_event_t *ev)
             rev->handler(rev);
 
             if (c->udp) {
+                if (c->udp->buffer == &buf) {
+                    ngx_udp_record_drop(buf.last - buf.pos, 1);
+                }
+
                 c->udp->buffer = NULL;
             }
 
@@ -426,16 +442,75 @@ ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf, size_t size)
 
     b = c->udp->buffer;
 
-    n = ngx_min(b->last - b->pos, (ssize_t) size);
-
-    ngx_memcpy(buf, b->pos, n);
+    n = b->last - b->pos;
 
     c->udp->buffer = NULL;
 
     c->read->ready = 0;
     c->read->active = 1;
 
+    if ((size_t) n > size) {
+        ngx_udp_record_drop(n, 0);
+        return NGX_AGAIN;
+    }
+
+    ngx_memcpy(buf, b->pos, n);
+
     return n;
+}
+
+
+static void
+ngx_udp_record_drop(size_t size, ngx_uint_t unread)
+{
+    if (unread) {
+        ngx_udp_unread_packets++;
+        ngx_udp_unread_bytes += size;
+
+    } else {
+        ngx_udp_oversized_packets++;
+        ngx_udp_oversized_bytes += size;
+    }
+
+    if (!ngx_udp_drop_event.timer_set) {
+        ngx_udp_drop_event.handler = ngx_udp_drop_timer_handler;
+        ngx_udp_drop_event.log = ngx_cycle->log;
+        ngx_udp_drop_event.cancelable = 1;
+
+        ngx_add_timer(&ngx_udp_drop_event, NGX_UDP_DROP_LOG_INTERVAL);
+    }
+}
+
+
+static void
+ngx_udp_drop_timer_handler(ngx_event_t *ev)
+{
+    ngx_udp_log_drops(ev->log, 0);
+}
+
+
+static void
+ngx_udp_log_drops(ngx_log_t *log, ngx_uint_t final)
+{
+    ngx_log_error(NGX_LOG_WARN, log, 0,
+                  "udp receive drops: oversized_packets=%uL "
+                  "oversized_bytes=%uL unread_packets=%uL "
+                  "unread_bytes=%uL final=%ui",
+                  ngx_udp_oversized_packets, ngx_udp_oversized_bytes,
+                  ngx_udp_unread_packets, ngx_udp_unread_bytes, final);
+}
+
+
+void
+ngx_event_udp_exit(ngx_cycle_t *cycle)
+{
+    if (ngx_udp_drop_event.timer_set) {
+        ngx_del_timer(&ngx_udp_drop_event);
+    }
+
+    if (ngx_udp_oversized_packets || ngx_udp_unread_packets) {
+        ngx_udp_log_drops(cycle->log, 1);
+    }
 }
 
 
@@ -674,6 +749,13 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
 }
 
 #else
+
+void
+ngx_event_udp_exit(ngx_cycle_t *cycle)
+{
+    return;
+}
+
 
 void
 ngx_delete_udp_connection(void *data)
