@@ -542,6 +542,13 @@ ngx_init_cycle(ngx_cycle_t *old_cycle)
                     if (ls[i].protocol != nls[n].protocol) {
                         nls[n].change_protocol = 1;
 
+#if (NGX_HAVE_REUSEPORT && NGX_HAVE_TRANSPARENT_PROXY)
+                    } else if (ccf->master
+                               && ls[i].transparent != nls[n].transparent)
+                    {
+                        nls[n].change_options = 1;
+#endif
+
                     } else {
                         nls[n].inherited = ls[i].inherited;
                         ls[i].remain = 1;
@@ -629,11 +636,21 @@ ngx_init_cycle(ngx_cycle_t *old_cycle)
 #endif
     }
 
+    if (!ngx_test_config
+        && ngx_preflight_listening_socket_options(cycle) != NGX_OK)
+    {
+        goto failed;
+    }
+
     if (ngx_open_listening_sockets(cycle) != NGX_OK) {
         goto failed;
     }
 
     if (!ngx_test_config) {
+        if (ngx_sync_listening_socket_options(cycle) != NGX_OK) {
+            goto failed;
+        }
+
         ngx_configure_listening_sockets(cycle);
     }
 
@@ -946,7 +963,24 @@ failed:
                           ngx_close_socket_n " %V failed",
                           &ls[i].addr_text);
         }
+
+#if (NGX_HAVE_UNIX_DOMAIN)
+
+        if (ls[i].sockaddr->sa_family == AF_UNIX) {
+            u_char  *name;
+
+            name = ls[i].addr_text.data + sizeof("unix:") - 1;
+
+            if (ngx_delete_file(name) == NGX_FILE_ERROR) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                              ngx_delete_file_n " %s failed", name);
+            }
+        }
+
+#endif
     }
+
+    ngx_rollback_listening_reuseport(cycle);
 
     ngx_destroy_cycle_pools(&conf);
 

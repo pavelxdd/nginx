@@ -71,10 +71,12 @@ struct ngx_listening_s {
 #endif
     unsigned            reuseport:1;
     unsigned            add_reuseport:1;
+    unsigned            restore_reuseport:1;
     unsigned            keepalive:2;
     unsigned            quic:1;
 
     unsigned            change_protocol:1;
+    unsigned            change_options:1;
 
     unsigned            deferred_accept:1;
     unsigned            delete_deferred:1;
@@ -227,7 +229,10 @@ ngx_listening_t *ngx_create_listening(ngx_conf_t *cf, struct sockaddr *sockaddr,
     socklen_t socklen);
 ngx_int_t ngx_clone_listening(ngx_cycle_t *cycle, ngx_listening_t *ls);
 ngx_int_t ngx_set_inherited_sockets(ngx_cycle_t *cycle);
+ngx_int_t ngx_preflight_listening_socket_options(ngx_cycle_t *cycle);
 ngx_int_t ngx_open_listening_sockets(ngx_cycle_t *cycle);
+void ngx_rollback_listening_reuseport(ngx_cycle_t *cycle);
+ngx_int_t ngx_sync_listening_socket_options(ngx_cycle_t *cycle);
 void ngx_configure_listening_sockets(ngx_cycle_t *cycle);
 void ngx_close_listening_sockets(ngx_cycle_t *cycle);
 void ngx_close_connection(ngx_connection_t *c);

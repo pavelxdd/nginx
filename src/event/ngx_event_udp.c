@@ -63,7 +63,7 @@ ngx_event_recvmsg(ngx_event_t *ev)
     static u_char       buffer[NGX_UDP_MAX_DATAGRAM_SIZE];
 
 #if (NGX_HAVE_ADDRINFO_CMSG)
-    u_char             msg_control[CMSG_SPACE(sizeof(ngx_addrinfo_t))];
+    u_char             msg_control[NGX_UDP_RECV_CMSG_SPACE];
 #endif
 
     if (ev->timedout) {
@@ -165,7 +165,7 @@ ngx_event_recvmsg(ngx_event_t *ev)
                  cmsg != NULL;
                  cmsg = CMSG_NXTHDR(&msg, cmsg))
             {
-                if (ngx_get_srcaddr_cmsg(cmsg, local_sockaddr) == NGX_OK) {
+                if (ngx_get_srcaddr_cmsg(cmsg, local_sockaddr, ls) == NGX_OK) {
                     break;
                 }
             }

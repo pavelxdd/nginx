@@ -19,6 +19,50 @@ ngx_os_io_t  ngx_io;
 static void ngx_drain_connections(ngx_cycle_t *cycle);
 
 
+#if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
+
+typedef struct {
+    ngx_socket_t  fd;
+    ngx_str_t    *addr_text;
+    const char   *name;
+    int           level;
+    int           option;
+    int           old_value;
+    int           new_value;
+
+    unsigned      reused:1;
+
+#if (NGX_HAVE_BINDTODEVICE)
+    unsigned      device:1;
+    char          old_device[IFNAMSIZ];
+    const char   *new_device;
+#endif
+} ngx_listening_socket_option_t;
+
+
+#if (NGX_HAVE_BINDTODEVICE)
+static ngx_int_t ngx_add_listening_device_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls);
+#endif
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+static ngx_int_t ngx_get_listening_transparent_option(ngx_listening_t *ls,
+    int *level, int *option, const char **name);
+static ngx_int_t ngx_add_listening_int_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls, int level, int option,
+    const char *name, int value);
+static ngx_int_t ngx_add_listening_transparent_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls, int value);
+static ngx_int_t ngx_add_listening_pktinfo_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls, int value);
+static ngx_int_t ngx_add_listening_origdst_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls, int value);
+#endif
+static ngx_int_t ngx_set_listening_socket_option(ngx_cycle_t *cycle,
+    ngx_listening_socket_option_t *option, ngx_uint_t restore);
+
+#endif
+
+
 ngx_listening_t *
 ngx_create_listening(ngx_conf_t *cf, struct sockaddr *sockaddr,
     socklen_t socklen)
@@ -157,6 +201,10 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
 #if (NGX_HAVE_BINDTODEVICE)
     char                       device[IFNAMSIZ];
 #endif
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+    int                        level, option, transparent;
+    const char                *option_name;
+#endif
 
     ls = cycle->listening.elts;
     for (i = 0; i < cycle->listening.nelts; i++) {
@@ -234,6 +282,29 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
             ls[i].ignore = 1;
             continue;
         }
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+
+        if (ngx_get_listening_transparent_option(&ls[i], &level, &option,
+                                                 &option_name)
+            == NGX_OK)
+        {
+            transparent = 0;
+            olen = sizeof(int);
+
+            if (getsockopt(ls[i].fd, level, option, &transparent, &olen)
+                == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              "getsockopt(%s) %V failed, ignored",
+                              option_name, &ls[i].addr_text);
+
+            } else {
+                ls[i].transparent = transparent ? 1 : 0;
+            }
+        }
+
+#endif
 
         olen = sizeof(int);
 
@@ -462,12 +533,83 @@ ngx_set_inherited_sockets(ngx_cycle_t *cycle)
 }
 
 
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+
+static ngx_int_t
+ngx_get_listening_transparent_option(ngx_listening_t *ls, int *level,
+    int *option, const char **name)
+{
+#if defined(SO_BINDANY)
+
+    *level = SOL_SOCKET;
+    *option = SO_BINDANY;
+    *name = "SO_BINDANY";
+
+    return NGX_OK;
+
+#else
+
+    switch (ls->sockaddr->sa_family) {
+
+    case AF_INET:
+
+#if defined(IP_TRANSPARENT)
+        *level = IPPROTO_IP;
+        *option = IP_TRANSPARENT;
+        *name = "IP_TRANSPARENT";
+
+        return NGX_OK;
+
+#elif defined(IP_BINDANY)
+        *level = IPPROTO_IP;
+        *option = IP_BINDANY;
+        *name = "IP_BINDANY";
+
+        return NGX_OK;
+#else
+        break;
+#endif
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+
+#if defined(IPV6_TRANSPARENT)
+        *level = IPPROTO_IPV6;
+        *option = IPV6_TRANSPARENT;
+        *name = "IPV6_TRANSPARENT";
+
+        return NGX_OK;
+
+#elif defined(IPV6_BINDANY)
+        *level = IPPROTO_IPV6;
+        *option = IPV6_BINDANY;
+        *name = "IPV6_BINDANY";
+
+        return NGX_OK;
+#else
+        break;
+#endif
+#endif
+
+    default:
+        break;
+    }
+
+    return NGX_DECLINED;
+
+#endif
+}
+
+#endif
+
+
 ngx_int_t
 ngx_open_listening_sockets(ngx_cycle_t *cycle)
 {
     int               reuseaddr;
 #if (NGX_HAVE_TRANSPARENT_PROXY)
-    int               value;
+    int               level, option, value;
+    const char       *option_name;
 #endif
     ngx_uint_t        i, tries, failed;
     ngx_err_t         err;
@@ -498,7 +640,9 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
 
 #if (NGX_HAVE_REUSEPORT)
 
-            if (ls[i].add_reuseport || ls[i].change_protocol) {
+            if (ls[i].add_reuseport || ls[i].change_protocol
+                || ls[i].change_options)
+            {
 
                 /*
                  * to allow transition from a socket without SO_REUSEPORT
@@ -506,13 +650,13 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
                  * SO_REUSEPORT on the old socket before opening new ones
                  *
                  * to allow transition between different socket protocols
-                 * (e.g. IPPROTO_MPTCP), SO_REUSEPORT is set on both old
-                 * and new sockets
+                 * (e.g. IPPROTO_MPTCP) or listener options, SO_REUSEPORT is
+                 * set on both old and new sockets
                  */
 
-                int  reuseport = 1;
-
 #ifdef SO_REUSEPORT_LB
+
+                int  reuseport = 1;
 
                 if (setsockopt(ls[i].fd, SOL_SOCKET, SO_REUSEPORT_LB,
                                (const void *) &reuseport, sizeof(int))
@@ -526,6 +670,25 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
 
 #else
 
+                int        old_reuseport, reuseport;
+                socklen_t  olen;
+
+                old_reuseport = 0;
+                olen = sizeof(int);
+
+                if (getsockopt(ls[i].fd, SOL_SOCKET, SO_REUSEPORT,
+                               (void *) &old_reuseport, &olen)
+                    == -1)
+                {
+                    ngx_log_error(NGX_LOG_EMERG, cycle->log,
+                                  ngx_socket_errno,
+                                  "getsockopt(SO_REUSEPORT) %V failed",
+                                  &ls[i].addr_text);
+                    return NGX_ERROR;
+                }
+
+                reuseport = 1;
+
                 if (setsockopt(ls[i].fd, SOL_SOCKET, SO_REUSEPORT,
                                (const void *) &reuseport, sizeof(int))
                     == -1)
@@ -533,6 +696,9 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
                     ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
                                   "setsockopt(SO_REUSEPORT) %V failed, ignored",
                                   &ls[i].addr_text);
+
+                } else if (!old_reuseport) {
+                    ls[i].restore_reuseport = 1;
                 }
 #endif
 
@@ -540,7 +706,9 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
             }
 #endif
 
-            if (ls[i].fd != (ngx_socket_t) -1 && !ls[i].change_protocol) {
+            if (ls[i].fd != (ngx_socket_t) -1 && !ls[i].change_protocol
+                && !ls[i].change_options)
+            {
                 continue;
             }
 
@@ -584,53 +752,31 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
 
 #if (NGX_HAVE_TRANSPARENT_PROXY)
             if (ls[i].transparent) {
-                value = ls[i].transparent;
-
-                switch (ls[i].sockaddr->sa_family) {
-#if (defined IP_TRANSPARENT)
-                case AF_INET:
-                    if (setsockopt(s, SOL_IP, IP_TRANSPARENT,
-                                   (const void *)&value, sizeof(int)) == -1)
-                    {
-                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
-                                      "setsockopt(IP_TRANSPARENT, %d) "
-                                      "%V failed", value, &ls[i].addr_text);
-
-                        if (ngx_close_socket(s) == -1) {
-                            ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
-                                          ngx_close_socket_n " %V failed",
-                                          &ls[i].addr_text);
-                        }
-
-                        return NGX_ERROR;
-                    }
-                    break;
-#endif
-
-#if (NGX_HAVE_INET6 && defined IPV6_TRANSPARENT)
-                case AF_INET6:
-                    if (setsockopt(s, SOL_IPV6, IPV6_TRANSPARENT,
-                                   (const void *)&value, sizeof(int)) == -1)
-                    {
-                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
-                                      "setsockopt(IPV6_TRANSPARENT, %d) "
-                                      "%V failed", value, &ls[i].addr_text);
-
-                        if (ngx_close_socket(s) == -1) {
-                            ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
-                                          ngx_close_socket_n " %V failed",
-                                          &ls[i].addr_text);
-                        }
-
-                        return NGX_ERROR;
-                    }
-                    break;
-#endif
-
-                default:
+                if (ngx_get_listening_transparent_option(&ls[i], &level,
+                                                         &option, &option_name)
+                    != NGX_OK)
+                {
                     ngx_log_error(NGX_LOG_EMERG, log, 0,
                                   "transparent proxying is not supported for %V",
                                   &ls[i].addr_text);
+
+                    if (ngx_close_socket(s) == -1) {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      ngx_close_socket_n " %V failed",
+                                      &ls[i].addr_text);
+                    }
+
+                    return NGX_ERROR;
+                }
+
+                value = 1;
+
+                if (setsockopt(s, level, option,
+                               (const void *) &value, sizeof(int)) == -1)
+                {
+                    ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                  "setsockopt(%s, %d) %V failed",
+                                  option_name, value, &ls[i].addr_text);
 
                     if (ngx_close_socket(s) == -1) {
                         ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
@@ -665,7 +811,8 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
 
 #if (NGX_HAVE_REUSEPORT)
 
-            if ((ls[i].reuseport || ls[i].change_protocol)
+            if ((ls[i].reuseport || ls[i].change_protocol
+                 || ls[i].change_options)
                 && !ngx_test_config)
             {
                 int  reuseport;
@@ -857,6 +1004,596 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
         ngx_log_error(NGX_LOG_EMERG, log, 0, "still could not bind()");
         return NGX_ERROR;
     }
+
+    return NGX_OK;
+}
+
+
+void
+ngx_rollback_listening_reuseport(ngx_cycle_t *cycle)
+{
+#if (NGX_LINUX && NGX_HAVE_REUSEPORT)
+    int               reuseport;
+    ngx_uint_t        i;
+    ngx_listening_t  *ls;
+
+    reuseport = 0;
+    ls = cycle->listening.elts;
+
+    for (i = 0; i < cycle->listening.nelts; i++) {
+        if (!ls[i].restore_reuseport || ls[i].previous == NULL) {
+            continue;
+        }
+
+        if (setsockopt(ls[i].previous->fd, SOL_SOCKET, SO_REUSEPORT,
+                       (const void *) &reuseport, sizeof(int))
+            == -1)
+        {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                          "restore setsockopt(SO_REUSEPORT) %V failed",
+                          &ls[i].addr_text);
+            continue;
+        }
+
+        ls[i].restore_reuseport = 0;
+    }
+#endif
+}
+
+
+#if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+
+static ngx_int_t
+ngx_add_listening_int_option(ngx_cycle_t *cycle, ngx_array_t *options,
+    ngx_listening_t *ls, int level, int option, const char *name, int value)
+{
+    int                             old_value;
+    socklen_t                       len;
+    ngx_err_t                       err;
+    ngx_listening_socket_option_t  *entry;
+
+    len = sizeof(int);
+
+    if (getsockopt(ls->fd, level, option, &old_value, &len) == -1) {
+        err = ngx_socket_errno;
+
+        if (value == 0
+            && (err == NGX_EINVAL || err == NGX_ENOPROTOOPT
+                || err == NGX_EOPNOTSUPP))
+        {
+            return NGX_OK;
+        }
+
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                      "getsockopt(%s) for %V failed", name, &ls->addr_text);
+        return NGX_ERROR;
+    }
+
+    if (old_value == value) {
+        return NGX_OK;
+    }
+
+    entry = ngx_array_push(options);
+    if (entry == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(entry, sizeof(ngx_listening_socket_option_t));
+    entry->fd = ls->fd;
+    entry->addr_text = &ls->addr_text;
+    entry->name = name;
+    entry->level = level;
+    entry->option = option;
+    entry->old_value = old_value;
+    entry->new_value = value;
+    entry->reused = !ls->open;
+
+    return NGX_OK;
+}
+
+#endif
+
+
+#if (NGX_HAVE_BINDTODEVICE)
+
+static ngx_int_t
+ngx_add_listening_device_option(ngx_cycle_t *cycle, ngx_array_t *options,
+    ngx_listening_t *ls)
+{
+    char                            device[IFNAMSIZ];
+    socklen_t                       len;
+    const char                     *desired;
+    ngx_err_t                       err;
+    ngx_listening_socket_option_t  *entry;
+
+    desired = ls->device ? ls->device : "";
+    ngx_memzero(device, sizeof(device));
+    len = sizeof(device);
+
+    if (getsockopt(ls->fd, SOL_SOCKET, SO_BINDTODEVICE, device, &len) == -1) {
+        err = ngx_socket_errno;
+
+        if (desired[0] == '\0'
+            && (err == NGX_EINVAL || err == NGX_ENOPROTOOPT
+                || err == NGX_EOPNOTSUPP))
+        {
+            return NGX_OK;
+        }
+
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                      "getsockopt(SO_BINDTODEVICE) for %V failed",
+                      &ls->addr_text);
+        return NGX_ERROR;
+    }
+
+    device[IFNAMSIZ - 1] = '\0';
+
+    if (ngx_strcmp(device, desired) == 0) {
+        return NGX_OK;
+    }
+
+    entry = ngx_array_push(options);
+    if (entry == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(entry, sizeof(ngx_listening_socket_option_t));
+    entry->fd = ls->fd;
+    entry->addr_text = &ls->addr_text;
+    entry->name = "SO_BINDTODEVICE";
+    entry->level = SOL_SOCKET;
+    entry->option = SO_BINDTODEVICE;
+    entry->reused = !ls->open;
+    entry->device = 1;
+    (void) ngx_cpystrn((u_char *) entry->old_device,
+                       (u_char *) device, IFNAMSIZ);
+    entry->new_device = desired;
+
+    return NGX_OK;
+}
+
+#endif
+
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+
+static ngx_int_t
+ngx_add_listening_transparent_option(ngx_cycle_t *cycle,
+    ngx_array_t *options, ngx_listening_t *ls, int value)
+{
+    int          level, option;
+    const char  *name;
+
+    if (ngx_get_listening_transparent_option(ls, &level, &option, &name)
+        == NGX_OK)
+    {
+        return ngx_add_listening_int_option(cycle, options, ls, level, option,
+                                            name, value);
+    }
+
+    if (value) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "transparent proxying is not supported for %V",
+                      &ls->addr_text);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_add_listening_pktinfo_option(ngx_cycle_t *cycle, ngx_array_t *options,
+    ngx_listening_t *ls, int value)
+{
+    switch (ls->sockaddr->sa_family) {
+
+    case AF_INET:
+
+#if (NGX_HAVE_IP_RECVDSTADDR)
+        return ngx_add_listening_int_option(cycle, options, ls,
+                                            IPPROTO_IP, IP_RECVDSTADDR,
+                                            "IP_RECVDSTADDR", value);
+#elif (NGX_HAVE_IP_PKTINFO)
+        return ngx_add_listening_int_option(cycle, options, ls,
+                                            IPPROTO_IP, IP_PKTINFO,
+                                            "IP_PKTINFO", value);
+#else
+        return NGX_OK;
+#endif
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+
+#if (NGX_HAVE_IPV6_RECVPKTINFO)
+        return ngx_add_listening_int_option(cycle, options, ls,
+                                            IPPROTO_IPV6,
+                                            IPV6_RECVPKTINFO,
+                                            "IPV6_RECVPKTINFO", value);
+#else
+        return NGX_OK;
+#endif
+#endif
+
+    default:
+        return NGX_OK;
+    }
+}
+
+
+static ngx_int_t
+ngx_add_listening_origdst_option(ngx_cycle_t *cycle, ngx_array_t *options,
+    ngx_listening_t *ls, int value)
+{
+    switch (ls->sockaddr->sa_family) {
+
+    case AF_INET:
+
+#if defined(IP_RECVORIGDSTADDR)
+        return ngx_add_listening_int_option(cycle, options, ls,
+                                            IPPROTO_IP, IP_RECVORIGDSTADDR,
+                                            "IP_RECVORIGDSTADDR", value);
+#else
+        return NGX_OK;
+#endif
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+
+#if defined(IPV6_RECVORIGDSTADDR)
+        return ngx_add_listening_int_option(cycle, options, ls,
+                                            IPPROTO_IPV6,
+                                            IPV6_RECVORIGDSTADDR,
+                                            "IPV6_RECVORIGDSTADDR", value);
+#else
+        return NGX_OK;
+#endif
+#endif
+
+    default:
+        return NGX_OK;
+    }
+}
+
+#endif
+
+
+static ngx_int_t
+ngx_set_listening_socket_option(ngx_cycle_t *cycle,
+    ngx_listening_socket_option_t *option, ngx_uint_t restore)
+{
+    int          value;
+    const void  *data;
+    socklen_t    len;
+
+#if (NGX_HAVE_BINDTODEVICE)
+    if (option->device) {
+        data = restore ? option->old_device : option->new_device;
+        len = ((const char *) data)[0] == '\0'
+              ? 0 : ngx_strlen((const char *) data) + 1;
+
+    } else
+#endif
+    {
+        value = restore ? option->old_value : option->new_value;
+        data = &value;
+        len = sizeof(int);
+    }
+
+    if (setsockopt(option->fd, option->level, option->option, data, len)
+        == -1)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                      "%ssetsockopt(%s) for %V failed",
+                      restore ? "restore " : "", option->name,
+                      option->addr_text);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+#endif
+
+
+ngx_int_t
+ngx_preflight_listening_socket_options(ngx_cycle_t *cycle)
+{
+#if (NGX_LINUX && NGX_HAVE_REUSEPORT)
+    int                             reuseport;
+    ngx_uint_t                      i, n, required;
+    ngx_array_t                     options;
+    ngx_socket_t                    s;
+    ngx_listening_t                 probe, *ls;
+#if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
+    ngx_listening_socket_option_t  *entry;
+#endif
+
+    required = 0;
+    ls = cycle->listening.elts;
+
+    for (i = 0; i < cycle->listening.nelts; i++) {
+        if (ls[i].add_reuseport || ls[i].change_protocol
+            || ls[i].change_options)
+        {
+            required = 1;
+            break;
+        }
+    }
+
+    if (!required) {
+        return NGX_OK;
+    }
+
+    for (i = 0; i < cycle->listening.nelts; i++) {
+        if (ls[i].ignore || ls[i].sockaddr->sa_family == AF_UNIX) {
+            continue;
+        }
+
+        s = ngx_socket(ls[i].sockaddr->sa_family, ls[i].type,
+                       ls[i].protocol);
+
+        if (s == (ngx_socket_t) -1) {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                          ngx_socket_n " %V failed", &ls[i].addr_text);
+            return NGX_ERROR;
+        }
+
+        reuseport = 1;
+
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT,
+                       (const void *) &reuseport, sizeof(int))
+            == -1)
+        {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_socket_errno,
+                          "setsockopt(SO_REUSEPORT) %V failed",
+                          &ls[i].addr_text);
+            goto failed;
+        }
+
+#if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
+        if (ngx_array_init(&options, cycle->pool, 4,
+                           sizeof(ngx_listening_socket_option_t))
+            != NGX_OK)
+        {
+            goto failed;
+        }
+
+        probe = ls[i];
+        probe.fd = s;
+        probe.open = 1;
+        probe.previous = NULL;
+
+#if (NGX_HAVE_BINDTODEVICE)
+        if (ngx_add_listening_device_option(cycle, &options, &probe)
+            != NGX_OK)
+        {
+            goto failed;
+        }
+#endif
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        if (!probe.wildcard || probe.type != SOCK_DGRAM) {
+            if (ngx_add_listening_transparent_option(cycle, &options, &probe,
+                                                     probe.transparent ? 1 : 0)
+                != NGX_OK)
+            {
+                goto failed;
+            }
+
+        } else if (probe.transparent) {
+            if (ngx_add_listening_origdst_option(cycle, &options, &probe, 1)
+                != NGX_OK
+                || ngx_add_listening_transparent_option(cycle, &options,
+                                                        &probe, 1)
+                   != NGX_OK)
+            {
+                goto failed;
+            }
+
+        } else {
+            if (ngx_add_listening_pktinfo_option(cycle, &options, &probe, 1)
+                != NGX_OK)
+            {
+                goto failed;
+            }
+        }
+#endif
+
+        entry = options.elts;
+
+        for (n = 0; n < options.nelts; n++) {
+            if (ngx_set_listening_socket_option(cycle, &entry[n], 0)
+                != NGX_OK)
+            {
+                goto failed;
+            }
+        }
+#endif
+
+        if (ngx_close_socket(s) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                          ngx_close_socket_n " %V failed", &ls[i].addr_text);
+        }
+    }
+#endif
+
+    return NGX_OK;
+
+#if (NGX_LINUX && NGX_HAVE_REUSEPORT)
+failed:
+
+    if (ngx_close_socket(s) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                      ngx_close_socket_n " %V failed", &ls[i].addr_text);
+    }
+
+    return NGX_ERROR;
+#endif
+}
+
+
+ngx_int_t
+ngx_sync_listening_socket_options(ngx_cycle_t *cycle)
+{
+#if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
+    ngx_uint_t                      i, restored, rollback_failed;
+    ngx_array_t                     options;
+    ngx_listening_t                *ls;
+    ngx_listening_socket_option_t  *entry;
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+    int                             socket_value, value;
+    ngx_core_conf_t                *ccf;
+#endif
+
+    if (cycle->listening.nelts == 0) {
+        return NGX_OK;
+    }
+
+    if (ngx_array_init(&options, cycle->pool, cycle->listening.nelts * 4,
+                       sizeof(ngx_listening_socket_option_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    ls = cycle->listening.elts;
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+#endif
+
+    for (i = 0; i < cycle->listening.nelts; i++) {
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        if (!ccf->master && !ls[i].open && ls[i].previous != NULL
+            && ls[i].transparent != ls[i].previous->transparent)
+        {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "transparent listener option change requires "
+                          "master_process on");
+            return NGX_ERROR;
+        }
+#endif
+
+#if (NGX_HAVE_BINDTODEVICE)
+        if (ngx_add_listening_device_option(cycle, &options, &ls[i])
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+#endif
+
+#if (NGX_HAVE_TRANSPARENT_PROXY)
+        value = ls[i].transparent ? 1 : 0;
+        socket_value = value;
+
+        if (!socket_value && !ls[i].open && ls[i].previous != NULL
+            && ls[i].previous->transparent)
+        {
+            socket_value = 1;
+        }
+
+        if (!ls[i].wildcard || ls[i].type != SOCK_DGRAM) {
+            if (ngx_add_listening_transparent_option(cycle, &options,
+                                                     &ls[i], socket_value)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            continue;
+        }
+
+        /*
+         * Reused UDP sockets remain shared with old workers until they exit.
+         * Keep both destination cmsgs and transparent mode enabled across a
+         * mode change so each worker can use its own configuration.
+         */
+
+        if (value) {
+            if (ngx_add_listening_origdst_option(cycle, &options, &ls[i], 1)
+                != NGX_OK
+                || ngx_add_listening_transparent_option(cycle, &options,
+                                                        &ls[i], socket_value)
+                   != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            if (ls[i].open
+                && ngx_add_listening_pktinfo_option(cycle, &options, &ls[i], 0)
+                   != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+        } else {
+            if (ngx_add_listening_pktinfo_option(cycle, &options, &ls[i], 1)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            if (ngx_add_listening_transparent_option(cycle, &options,
+                                                     &ls[i], socket_value)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            if (ls[i].open
+                && ngx_add_listening_origdst_option(cycle, &options, &ls[i], 0)
+                   != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+        }
+#endif
+    }
+
+    entry = options.elts;
+
+    for (i = 0; i < options.nelts; i++) {
+        if (ngx_set_listening_socket_option(cycle, &entry[i], 0) == NGX_OK) {
+            continue;
+        }
+
+        restored = 0;
+        rollback_failed = 0;
+
+        while (i > 0) {
+            i--;
+
+            if (!entry[i].reused) {
+                continue;
+            }
+
+            if (ngx_set_listening_socket_option(cycle, &entry[i], 1)
+                != NGX_OK)
+            {
+                rollback_failed = 1;
+
+            } else {
+                restored = 1;
+            }
+        }
+
+        if (rollback_failed) {
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "listener socket option rollback failed");
+
+        } else if (restored) {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "listener socket options restored after failed "
+                          "reload");
+        }
+
+        return NGX_ERROR;
+    }
+#endif
 
     return NGX_OK;
 }
