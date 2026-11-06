@@ -2161,6 +2161,11 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 cl->buf->temporary = (n ? 1 : 0);
                 cl->buf->last_buf = src->read->eof;
                 cl->buf->flush = !src->read->eof;
+                cl->buf->sfc_udp_dscp_set = 0;
+                if (!from_upstream && c->type == SOCK_DGRAM) {
+                    cl->buf->sfc_udp_dscp = c->buffer->sfc_udp_dscp;
+                    cl->buf->sfc_udp_dscp_set = c->buffer->sfc_udp_dscp_set;
+                }
 
                 (*packets)++;
                 *received += n;

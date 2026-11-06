@@ -53,7 +53,8 @@ typedef union {
 #endif
 } ngx_addrinfo_t;
 
-#define NGX_UDP_RECV_CMSG_SPACE  (2 * CMSG_SPACE(sizeof(ngx_addrinfo_t)))
+#define NGX_UDP_RECV_CMSG_SPACE  (2 * CMSG_SPACE(sizeof(ngx_addrinfo_t))       \
+                                 + CMSG_SPACE(sizeof(int)))
 
 size_t ngx_set_srcaddr_cmsg(struct cmsghdr *cmsg,
     struct sockaddr *local_sockaddr);
