@@ -185,7 +185,7 @@ ngx_module_t  ngx_event_core_module = {
     ngx_event_process_init,                /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
+    ngx_event_udp_exit,                    /* exit process */
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };

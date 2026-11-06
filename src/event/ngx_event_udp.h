@@ -68,6 +68,7 @@ void ngx_udp_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
 #endif
 
+void ngx_event_udp_exit(ngx_cycle_t *cycle);
 void ngx_delete_udp_connection(void *data);
 
 
