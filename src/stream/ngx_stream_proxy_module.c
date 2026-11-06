@@ -27,6 +27,7 @@ typedef struct {
 typedef struct {
     ngx_msec_t                       connect_timeout;
     ngx_msec_t                       timeout;
+    ngx_msec_t                       drain_timeout;
     ngx_msec_t                       next_upstream_timeout;
     size_t                           buffer_size;
     ngx_stream_complex_value_t      *upload_rate;
@@ -90,6 +91,8 @@ static void ngx_stream_proxy_process(ngx_stream_session_t *s,
     ngx_uint_t from_upstream, ngx_uint_t do_write);
 static ngx_int_t ngx_stream_proxy_test_finalize(ngx_stream_session_t *s,
     ngx_uint_t from_upstream);
+static ngx_uint_t ngx_stream_proxy_failed(ngx_stream_session_t *s);
+static void ngx_stream_proxy_error_close_handler(ngx_event_t *ev);
 static void ngx_stream_proxy_next_upstream(ngx_stream_session_t *s);
 static void ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc);
 static u_char *ngx_stream_proxy_log_error(ngx_log_t *log, u_char *buf,
@@ -223,6 +226,13 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
       ngx_conf_set_msec_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_proxy_srv_conf_t, timeout),
+      NULL },
+
+    { ngx_string("proxy_drain_timeout"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, drain_timeout),
       NULL },
 
     { ngx_string("proxy_buffer_size"),
@@ -463,6 +473,7 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     u_char                           *p;
     ngx_str_t                        *host;
     ngx_uint_t                        i;
+    ngx_event_t                      *ev;
     ngx_connection_t                 *c;
     ngx_resolver_ctx_t               *ctx, temp;
     ngx_stream_upstream_t            *u;
@@ -485,6 +496,16 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     }
 
     s->upstream = u;
+
+    if (c->type == SOCK_STREAM) {
+        ev = ngx_pcalloc(c->pool, sizeof(ngx_event_t));
+        if (ev == NULL) {
+            ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        ngx_stream_set_ctx(s, ev, ngx_stream_proxy_module);
+    }
 
     s->log_handler = ngx_stream_proxy_log_error;
 
@@ -1848,7 +1869,9 @@ ngx_stream_proxy_process_connection(ngx_event_t *ev, ngx_uint_t from_upstream)
                     return;
                 }
 
-                if (u->connected && !c->read->delayed && !pc->read->delayed) {
+                if (u->connected && !c->read->delayed && !pc->read->delayed
+                    && !ngx_stream_proxy_failed(s))
+                {
                     ngx_add_timer(c->write, pscf->timeout);
                 }
 
@@ -2061,7 +2084,9 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
     for ( ;; ) {
 
-        if (do_write && dst) {
+        if (do_write && dst
+            && (c->type == SOCK_DGRAM || (!dst->write->error && !dst->error)))
+        {
 
             if (*out || *busy || dst->buffered) {
                 c->log->action = send_action;
@@ -2069,6 +2094,11 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 rc = ngx_stream_top_filter(s, *out, from_upstream);
 
                 if (rc == NGX_ERROR) {
+                    if (c->type == SOCK_STREAM) {
+                        dst->write->error = 1;
+                        break;
+                    }
+
                     ngx_stream_proxy_finalize(s, NGX_STREAM_OK);
                     return;
                 }
@@ -2090,7 +2120,9 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
         size = b->end - b->last;
 
-        if (size && src->read->ready && !src->read->delayed) {
+        if (size && src->read->ready && !src->read->delayed
+            && !ngx_stream_proxy_failed(s))
+        {
 
             if (limit_rate) {
                 limit = (off_t) limit_rate * (ngx_time() - u->start_sec + 1)
@@ -2117,8 +2149,21 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             }
 
             if (n == NGX_ERROR) {
+                if (c->type == SOCK_STREAM) {
+                    src->error = 1;
+                    src->read->error = 1;
+                    break;
+                }
+
                 src->read->eof = 1;
                 n = 0;
+            }
+
+            if (n == 0 && ngx_connection_test_half_close(src) != NGX_OK)
+            {
+                src->error = 1;
+                src->read->error = 1;
+                break;
             }
 
             if (n >= 0) {
@@ -2195,20 +2240,26 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
     if (dst) {
 
         if (dst->type == SOCK_STREAM && pscf->half_close
-            && src->read->eof && !u->half_closed && !dst->buffered)
+            && src->read->eof && !u->half_closed && !dst->buffered
+            && !ngx_stream_proxy_failed(s))
         {
             if (ngx_shutdown_socket(dst->fd, NGX_WRITE_SHUTDOWN) == -1) {
                 ngx_connection_error(c, ngx_socket_errno,
                                      ngx_shutdown_socket_n " failed");
 
-                ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-                return;
-            }
+                dst->write->error = 1;
 
-            u->half_closed = 1;
-            ngx_log_debug1(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
-                           "stream proxy %s socket shutdown",
-                           from_upstream ? "client" : "upstream");
+                if (ngx_stream_proxy_test_finalize(s, from_upstream) == NGX_OK) {
+                    return;
+                }
+
+            } else {
+                dst->write->eof = 1;
+                u->half_closed = 1;
+                ngx_log_debug1(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
+                               "stream proxy %s socket shutdown",
+                               from_upstream ? "client" : "upstream");
+            }
         }
 
         if (ngx_handle_write_event(dst->write, 0) != NGX_OK) {
@@ -2216,7 +2267,9 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             return;
         }
 
-        if (!c->read->delayed && !pc->read->delayed) {
+        if (!ngx_stream_proxy_failed(s)
+            && !c->read->delayed && !pc->read->delayed)
+        {
             ngx_add_timer(c->write, pscf->timeout);
 
         } else if (c->write->timer_set) {
@@ -2230,6 +2283,9 @@ static ngx_int_t
 ngx_stream_proxy_test_finalize(ngx_stream_session_t *s,
     ngx_uint_t from_upstream)
 {
+    ngx_int_t                     rc;
+    ngx_event_t                  *ev;
+    ngx_msec_int_t                remaining;
     ngx_connection_t             *c, *pc;
     ngx_log_handler_pt            handler;
     ngx_stream_upstream_t        *u;
@@ -2281,6 +2337,57 @@ ngx_stream_proxy_test_finalize(ngx_stream_session_t *s,
 
     /* c->type == SOCK_STREAM */
 
+    if (ngx_stream_proxy_failed(s)) {
+        ev = ngx_stream_get_module_ctx(s, ngx_stream_proxy_module);
+
+        if (ev->handler == NULL) {
+            ev->data = s;
+            ev->handler = ngx_stream_proxy_error_close_handler;
+            ev->log = c->log;
+
+            /* One expiry covers userspace output and kernel queue drainage. */
+            ngx_add_timer(ev, pscf->drain_timeout);
+
+            if (c->write->timer_set) {
+                ngx_del_timer(c->write);
+            }
+        }
+
+        remaining = (ngx_msec_int_t) (ev->timer.key - ngx_current_msec);
+
+        if (remaining > 0 && pc
+            && ((!c->write->error && !c->error
+                 && (c->buffered || u->downstream_out || u->downstream_busy))
+                || (!pc->write->error && !pc->error
+                    && (pc->buffered || u->upstream_out || u->upstream_busy))))
+        {
+            return NGX_DECLINED;
+        }
+
+        if (ev && ev->timer_set) {
+            ngx_del_timer(ev);
+        }
+
+        rc = ngx_connection_set_error_close(c, ngx_max(remaining, 0));
+
+        if (pc
+            && ngx_connection_set_error_close(pc, ngx_max(remaining, 0))
+               == NGX_AGAIN)
+        {
+            rc = NGX_AGAIN;
+        }
+
+        if (rc == NGX_AGAIN) {
+            return NGX_OK;
+        }
+
+        rc = pc && (pc->error || pc->read->error || pc->write->error)
+             ? NGX_STREAM_BAD_GATEWAY : NGX_STREAM_OK;
+
+        ngx_stream_proxy_finalize(s, rc);
+        return NGX_OK;
+    }
+
     if (pc == NULL
         || (!c->read->eof && !pc->read->eof)
         || (!c->read->eof && c->buffered)
@@ -2311,6 +2418,31 @@ ngx_stream_proxy_test_finalize(ngx_stream_session_t *s,
     ngx_stream_proxy_finalize(s, NGX_STREAM_OK);
 
     return NGX_OK;
+}
+
+
+static void
+ngx_stream_proxy_error_close_handler(ngx_event_t *ev)
+{
+    ngx_stream_session_t  *s;
+
+    s = ev->data;
+
+    (void) ngx_stream_proxy_test_finalize(s, 0);
+}
+
+
+static ngx_uint_t
+ngx_stream_proxy_failed(ngx_stream_session_t *s)
+{
+    ngx_connection_t  *c, *pc;
+
+    c = s->connection;
+    pc = s->upstream->peer.connection;
+
+    return c->type == SOCK_STREAM
+           && (c->error || c->read->error || c->write->error
+               || (pc && (pc->error || pc->read->error || pc->write->error)));
 }
 
 
@@ -2384,6 +2516,7 @@ static void
 ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
 {
     ngx_uint_t              state;
+    ngx_event_t            *ev;
     ngx_connection_t       *pc;
     ngx_stream_upstream_t  *u;
 
@@ -2400,6 +2533,11 @@ ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
 
     if (u->local_retry.timer_set) {
         ngx_del_timer(&u->local_retry);
+    }
+
+    ev = ngx_stream_get_module_ctx(s, ngx_stream_proxy_module);
+    if (ev && ev->timer_set) {
+        ngx_del_timer(ev);
     }
 
     if (u->resolved && u->resolved->ctx) {
@@ -2510,6 +2648,7 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
 
     conf->connect_timeout = NGX_CONF_UNSET_MSEC;
     conf->timeout = NGX_CONF_UNSET_MSEC;
+    conf->drain_timeout = NGX_CONF_UNSET_MSEC;
     conf->next_upstream_timeout = NGX_CONF_UNSET_MSEC;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
     conf->upload_rate = NGX_CONF_UNSET_PTR;
@@ -2556,6 +2695,9 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_msec_value(conf->timeout,
                               prev->timeout, 10 * 60000);
+
+    ngx_conf_merge_msec_value(conf->drain_timeout,
+                              prev->drain_timeout, 5000);
 
     ngx_conf_merge_msec_value(conf->next_upstream_timeout,
                               prev->next_upstream_timeout, 0);

@@ -8,6 +8,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_event.h>
+#if (NGX_LINUX)
+#include <poll.h>
+#endif
 #if (NGX_HAVE_BINDTODEVICE)
 #include <net/if.h>
 #endif
@@ -17,6 +20,18 @@ ngx_os_io_t  ngx_io;
 
 
 static void ngx_drain_connections(ngx_cycle_t *cycle);
+
+#if (NGX_LINUX)
+struct ngx_connection_lingering_s {
+    ngx_event_handler_pt  read_handler;
+    ngx_event_handler_pt  write_handler;
+    ngx_msec_t            deadline;
+    unsigned              done:1;
+};
+
+static void ngx_connection_lingering_handler(ngx_event_t *ev);
+static void ngx_connection_lingering_write_handler(ngx_event_t *ev);
+#endif
 
 
 #if (NGX_HAVE_BINDTODEVICE || NGX_HAVE_TRANSPARENT_PROXY)
@@ -2304,6 +2319,227 @@ ngx_free_connection(ngx_connection_t *c)
         ngx_cycle->files[c->fd] = NULL;
     }
 }
+
+
+ngx_int_t
+ngx_connection_test_half_close(ngx_connection_t *c)
+{
+#if (NGX_LINUX && NGX_HAVE_UNIX_DOMAIN)
+    int            n;
+    struct pollfd  pfd;
+
+    if (c->type != SOCK_STREAM || c->write->eof) {
+        return NGX_OK;
+    }
+
+    if (ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (c->local_sockaddr->sa_family != AF_UNIX) {
+        return NGX_OK;
+    }
+
+    pfd.fd = c->fd;
+    pfd.events = 0;
+    pfd.revents = 0;
+
+    do {
+        n = poll(&pfd, 1, 0);
+    } while (n == -1 && ngx_socket_errno == NGX_EINTR);
+
+    if (n == -1) {
+        ngx_connection_error(c, ngx_socket_errno, "poll() failed");
+        return NGX_ERROR;
+    }
+
+    if (pfd.revents & (POLLHUP|POLLERR|POLLNVAL)) {
+        return NGX_ERROR;
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_connection_set_error_close(ngx_connection_t *c, ngx_msec_t timeout)
+{
+#if (NGX_LINUX)
+    int                         pending;
+    struct linger               linger;
+    ngx_connection_lingering_t  *lc;
+
+    if (c->lingering) {
+        if (!c->lingering->done) {
+            return NGX_AGAIN;
+        }
+
+        goto reset;
+    }
+#endif
+
+#if (NGX_SSL)
+    if (c->ssl) {
+        c->ssl->no_send_shutdown = 1;
+        c->ssl->no_wait_shutdown = 1;
+    }
+#endif
+
+#if (NGX_LINUX)
+    if (c->type != SOCK_STREAM
+        || ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK)
+    {
+        return NGX_OK;
+    }
+
+#if (NGX_HAVE_UNIX_DOMAIN)
+    if (c->local_sockaddr->sa_family == AF_UNIX) {
+        return NGX_OK;
+    }
+#endif
+
+    if (c->error || c->read->error || c->write->error) {
+        goto reset;
+    }
+
+    if (ioctl(c->fd, TIOCOUTQ, &pending) == -1) {
+        ngx_connection_error(c, ngx_socket_errno, "ioctl(TIOCOUTQ) failed");
+        pending = -1;
+    }
+
+    /* Keep the socket owned while output could be lost to an orphan reset. */
+    if (pending) {
+        lc = ngx_pcalloc(c->pool, sizeof(ngx_connection_lingering_t));
+        if (lc == NULL) {
+            goto reset;
+        }
+
+        lc->read_handler = c->read->handler;
+        lc->write_handler = c->write->handler;
+        lc->deadline = ngx_current_msec + timeout;
+        c->lingering = lc;
+
+        if (c->read->timer_set) {
+            ngx_del_timer(c->read);
+        }
+
+        if (c->write->timer_set) {
+            ngx_del_timer(c->write);
+        }
+
+        c->read->delayed = 0;
+        c->read->handler = ngx_connection_lingering_handler;
+        c->write->handler = ngx_connection_lingering_write_handler;
+
+        if (c->read->posted) {
+            ngx_delete_posted_event(c->read);
+        }
+
+        ngx_post_event(c->read, &ngx_posted_events);
+        return NGX_AGAIN;
+    }
+
+reset:
+
+    linger.l_onoff = 1;
+    linger.l_linger = 0;
+
+    if (setsockopt(c->fd, SOL_SOCKET, SO_LINGER,
+                   (const void *) &linger, sizeof(struct linger)) == -1)
+    {
+        ngx_connection_error(c, ngx_socket_errno,
+                             "setsockopt(SO_LINGER) failed");
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+#if (NGX_LINUX)
+
+static void
+ngx_connection_lingering_handler(ngx_event_t *ev)
+{
+    int                         pending;
+    size_t                      received;
+    ssize_t                     n;
+    ngx_msec_int_t              remaining;
+    ngx_connection_t           *c;
+    ngx_connection_lingering_t  *lc;
+    u_char                      buffer[4096];
+
+    c = ev->data;
+    lc = c->lingering;
+    ev->timedout = 0;
+    remaining = (ngx_msec_int_t) (lc->deadline - ngx_current_msec);
+
+    if (remaining <= 0 || c->close) {
+        goto done;
+    }
+
+    received = 0;
+
+    while (!ev->eof && !ev->error) {
+        /* Discard transport input, including TLS records, without sending it. */
+        n = ngx_recv(c, buffer, sizeof(buffer));
+
+        if (n == NGX_AGAIN || n == NGX_ERROR || n == 0) {
+            break;
+        }
+
+        received += n;
+
+        if (!ev->ready || received >= 65536) {
+            break;
+        }
+    }
+
+    if (c->error || ev->error || c->write->error
+        || (ioctl(c->fd, TIOCOUTQ, &pending) == 0 && pending == 0))
+    {
+        goto done;
+    }
+
+    if (!ev->eof && !ev->error && ngx_handle_read_event(ev, 0) != NGX_OK) {
+        goto done;
+    }
+
+    /* Yield under continuous input so cached time and the deadline advance. */
+    if (ev->ready && !ev->eof && !ev->error) {
+        ngx_post_event(ev, &ngx_posted_next_events);
+    }
+
+    /* ACKs need not produce a read event; poll within the original deadline. */
+    ngx_add_timer(ev, ngx_min((ngx_msec_t) remaining, 50));
+    return;
+
+done:
+
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    lc->done = 1;
+    ev->handler = lc->read_handler;
+    c->write->handler = lc->write_handler;
+
+    if (ev->posted) {
+        ngx_delete_posted_event(ev);
+    }
+
+    ngx_post_event(ev, &ngx_posted_events);
+}
+
+
+static void
+ngx_connection_lingering_write_handler(ngx_event_t *ev)
+{
+    return;
+}
+
+#endif
 
 
 void

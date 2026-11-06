@@ -130,6 +130,9 @@ typedef enum {
 #define NGX_HTTP_V2_BUFFERED   0x02
 
 
+typedef struct ngx_connection_lingering_s  ngx_connection_lingering_t;
+
+
 struct ngx_connection_s {
     void               *data;
     ngx_event_t        *read;
@@ -211,6 +214,8 @@ struct ngx_connection_s {
 #if (NGX_THREADS || NGX_COMPAT)
     ngx_thread_task_t  *sendfile_task;
 #endif
+
+    ngx_connection_lingering_t  *lingering;
 };
 
 
@@ -235,6 +240,9 @@ void ngx_rollback_listening_reuseport(ngx_cycle_t *cycle);
 ngx_int_t ngx_sync_listening_socket_options(ngx_cycle_t *cycle);
 void ngx_configure_listening_sockets(ngx_cycle_t *cycle);
 void ngx_close_listening_sockets(ngx_cycle_t *cycle);
+ngx_int_t ngx_connection_test_half_close(ngx_connection_t *c);
+ngx_int_t ngx_connection_set_error_close(ngx_connection_t *c,
+    ngx_msec_t timeout);
 void ngx_close_connection(ngx_connection_t *c);
 void ngx_close_idle_connections(ngx_cycle_t *cycle);
 ngx_int_t ngx_connection_local_sockaddr(ngx_connection_t *c, ngx_str_t *s,
