@@ -17,12 +17,24 @@
 #define NGX_PROXY_PROTOCOL_MAX_HEADER     4096
 
 
+typedef union {
+    struct in_addr      addr4;
+#if (NGX_HAVE_INET6)
+    struct in6_addr     addr6;
+#endif
+} ngx_sin_addr_t;
+
+
 struct ngx_proxy_protocol_s {
     ngx_str_t           src_addr;
     ngx_str_t           dst_addr;
     in_port_t           src_port;
     in_port_t           dst_port;
     ngx_str_t           tlvs;
+    int                 family;
+    int                 transport;
+    ngx_sin_addr_t      src_sa;
+    ngx_sin_addr_t      dst_sa;
 };
 
 
@@ -34,6 +46,8 @@ u_char *ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf,
     u_char *last, ngx_array_t *tlvs);
 ngx_int_t ngx_proxy_protocol_get_tlv(ngx_connection_t *c, ngx_str_t *name,
     ngx_str_t *value);
+ngx_int_t ngx_proxy_protocol_lookup_tlv(ngx_connection_t *c,
+    ngx_str_t *tlvs, ngx_uint_t type, ngx_str_t *value);
 
 
 #endif /* _NGX_PROXY_PROTOCOL_H_INCLUDED_ */

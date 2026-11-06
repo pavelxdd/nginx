@@ -1406,9 +1406,6 @@ ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return "\"so_keepalive\" parameter is incompatible with \"udp\"";
         }
 
-        if (lsopt.proxy_protocol) {
-            return "\"proxy_protocol\" parameter is incompatible with \"udp\"";
-        }
     }
 
     for (n = 0; n < u.naddrs; n++) {
