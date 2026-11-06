@@ -342,6 +342,9 @@ typedef struct {
 typedef void (*ngx_http_upstream_handler_pt)(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 
+typedef ngx_int_t (*ngx_http_upstream_peer_hook_pt)(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
+
 
 struct ngx_http_upstream_s {
     ngx_http_upstream_handler_pt     read_event_handler;
@@ -465,6 +468,12 @@ ngx_int_t ngx_http_upstream_merge_ssl_passwords(ngx_conf_t *cf,
 #define ngx_http_conf_upstream_srv_conf(uscf, module)                         \
     uscf->srv_conf[module.ctx_index]
 
+
+extern ngx_http_upstream_peer_hook_pt  ngx_http_upstream_peer_hook;
+
+/* NGX_AGAIN suspends connect; the hook owner resumes a live r/u exactly once. */
+void ngx_http_upstream_peer_resume(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_int_t rc);
 
 extern ngx_module_t        ngx_http_upstream_module;
 extern ngx_conf_bitmask_t  ngx_http_upstream_cache_method_mask[];

@@ -13,6 +13,9 @@
 #endif
 
 
+ngx_http_upstream_peer_hook_pt  ngx_http_upstream_peer_hook;
+
+
 #if (NGX_HTTP_CACHE)
 static ngx_int_t ngx_http_upstream_cache(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
@@ -1583,9 +1586,7 @@ ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
 static void
 ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
-    ngx_int_t                  rc;
-    ngx_connection_t          *c;
-    ngx_http_core_loc_conf_t  *clcf;
+    ngx_int_t  rc;
 
     r->connection->log->action = "connecting to upstream";
 
@@ -1607,6 +1608,32 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->state->response_time = (ngx_msec_t) -1;
     u->state->connect_time = (ngx_msec_t) -1;
     u->state->header_time = (ngx_msec_t) -1;
+
+    rc = NGX_OK;
+
+    if (ngx_http_upstream_peer_hook) {
+        rc = ngx_http_upstream_peer_hook(r, u);
+    }
+
+    if (rc == NGX_AGAIN) {
+        return;
+    }
+
+    ngx_http_upstream_peer_resume(r, u, rc);
+}
+
+
+void
+ngx_http_upstream_peer_resume(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_int_t rc)
+{
+    ngx_connection_t          *c;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    if (rc != NGX_OK) {
+        ngx_http_upstream_finalize_request(r, u, rc);
+        return;
+    }
 
     rc = ngx_event_connect_peer(&u->peer);
 
