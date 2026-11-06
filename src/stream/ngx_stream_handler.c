@@ -16,12 +16,20 @@ static void ngx_stream_close_connection(ngx_connection_t *c);
 static u_char *ngx_stream_log_error(ngx_log_t *log, u_char *buf, size_t len);
 static void ngx_stream_proxy_protocol_handler(ngx_event_t *rev);
 
+ngx_int_t sfc_loop_proxy_protocol_read(ngx_connection_t *c, u_char *buf,
+    u_char *last, u_char **pos);
+ngx_int_t sfc_loop_udp_preread(ngx_connection_t *c, ngx_buf_t *b,
+    const u_char *route_key, size_t route_key_len);
+ngx_uint_t sfc_loop_udp_session_persistent(ngx_connection_t *c);
+void ngx_stream_sfc_loop_udp_finalize(ngx_connection_t *c, ngx_int_t rc);
+
 
 void
 ngx_stream_init_connection(ngx_connection_t *c)
 {
     u_char                        text[NGX_SOCKADDR_STRLEN];
     size_t                        len;
+    ngx_int_t                     rc;
     ngx_uint_t                    i;
     ngx_time_t                   *tp;
     ngx_event_t                  *rev;
@@ -177,6 +185,20 @@ ngx_stream_init_connection(ngx_connection_t *c)
     s->start_sec = tp->sec;
     s->start_msec = tp->msec;
 
+    if (c->type == SOCK_DGRAM && !addr_conf->proxy_protocol && c->buffer)
+    {
+        rc = sfc_loop_udp_preread(c, c->buffer,
+                                  c->udp->key.data == (u_char *) c->sockaddr
+                                      ? NULL : c->udp->key.data,
+                                  c->udp->key.data == (u_char *) c->sockaddr
+                                      ? 0 : c->udp->key.len);
+
+        if (rc != NGX_OK && rc != NGX_DECLINED) {
+            ngx_stream_sfc_loop_udp_finalize(c, rc);
+            return;
+        }
+    }
+
     rev = c->read;
     rev->handler = ngx_stream_session_handler;
 
@@ -216,6 +238,7 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
     u_char                      *p, buf[NGX_PROXY_PROTOCOL_MAX_HEADER];
     size_t                       size;
     ssize_t                      n;
+    ngx_int_t                    rc;
     ngx_err_t                    err;
     ngx_connection_t            *c;
     ngx_stream_session_t        *s;
@@ -240,6 +263,21 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
             return;
         }
 
+        rc = sfc_loop_udp_preread(c, c->buffer,
+                                  c->udp->key.data == (u_char *) c->sockaddr
+                                      ? NULL : c->udp->key.data,
+                                  c->udp->key.data == (u_char *) c->sockaddr
+                                      ? 0 : c->udp->key.len);
+
+        if (rc != NGX_OK && rc != NGX_DECLINED) {
+            ngx_stream_sfc_loop_udp_finalize(c, rc);
+            return;
+        }
+
+        if (rc == NGX_OK) {
+            goto udp_done;
+        }
+
         p = ngx_proxy_protocol_read(c, c->buffer->pos, c->buffer->last);
 
         if (p == NULL) {
@@ -249,13 +287,17 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
 
         c->buffer->pos = p;
 
+    udp_done:
+
         if (c->buffer->pos == c->buffer->last) {
             c->buffer->pos = c->buffer->start;
             c->buffer->last = c->buffer->start;
         }
 
-        /* Each PROXY header applies to one UDP datagram. */
-        ngx_delete_udp_connection(c);
+        if (!sfc_loop_udp_session_persistent(c)) {
+            /* Each ordinary PROXY header applies to one UDP datagram. */
+            ngx_delete_udp_connection(c);
+        }
 
         goto done;
     }
@@ -268,21 +310,7 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
 
     if (n == -1) {
         if (err == NGX_EAGAIN) {
-            rev->ready = 0;
-
-            if (!rev->timer_set) {
-                cscf = ngx_stream_get_module_srv_conf(s,
-                                                      ngx_stream_core_module);
-
-                ngx_add_timer(rev, cscf->proxy_protocol_timeout);
-            }
-
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                ngx_stream_finalize_session(s,
-                                            NGX_STREAM_INTERNAL_SERVER_ERROR);
-            }
-
-            return;
+            goto again;
         }
 
         ngx_connection_error(c, err, "recv() failed");
@@ -291,8 +319,20 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
         return;
     }
 
-    if (rev->timer_set) {
-        ngx_del_timer(rev);
+    p = buf;
+
+    rc = sfc_loop_proxy_protocol_read(c, buf, buf + n, &p);
+    if (rc == NGX_OK) {
+        goto tcp_done;
+    }
+
+    if (rc == NGX_AGAIN) {
+        goto again;
+    }
+
+    if (rc == NGX_ERROR) {
+        ngx_stream_finalize_session(s, NGX_STREAM_BAD_REQUEST);
+        return;
     }
 
     p = ngx_proxy_protocol_read(c, buf, buf + n);
@@ -300,6 +340,12 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
     if (p == NULL) {
         ngx_stream_finalize_session(s, NGX_STREAM_BAD_REQUEST);
         return;
+    }
+
+    tcp_done:
+
+    if (rev->timer_set) {
+        ngx_del_timer(rev);
     }
 
     size = p - buf;
@@ -314,6 +360,21 @@ done:
     c->log->action = "initializing session";
 
     ngx_stream_session_handler(rev);
+    return;
+
+again:
+
+    rev->ready = 0;
+
+    if (!rev->timer_set) {
+        cscf = ngx_stream_get_module_srv_conf(s, ngx_stream_core_module);
+
+        ngx_add_timer(rev, cscf->proxy_protocol_timeout);
+    }
+
+    if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    }
 }
 
 
@@ -327,6 +388,19 @@ ngx_stream_session_handler(ngx_event_t *rev)
     s = c->data;
 
     ngx_stream_core_run_phases(s);
+}
+
+
+void
+ngx_stream_sfc_loop_udp_finalize(ngx_connection_t *c, ngx_int_t rc)
+{
+    if (rc != NGX_STREAM_BAD_REQUEST && rc != NGX_STREAM_FORBIDDEN
+        && rc != NGX_STREAM_INTERNAL_SERVER_ERROR)
+    {
+        rc = NGX_STREAM_INTERNAL_SERVER_ERROR;
+    }
+
+    ngx_stream_finalize_session(c->data, (ngx_uint_t) rc);
 }
 
 
