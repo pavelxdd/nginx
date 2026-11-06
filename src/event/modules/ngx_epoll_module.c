@@ -784,6 +784,7 @@ static ngx_int_t
 ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 {
     int                events;
+    sigset_t           set, oldset;
     uint32_t           revents;
     ngx_int_t          instance, i;
     ngx_uint_t         level;
@@ -797,9 +798,34 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                    "epoll timer: %M", timer);
 
-    events = epoll_wait(ep, event_list, (int) nevents, timer);
+    /* A handled signal must not be lost between the flag check and the wait. */
+
+    sigfillset(&set);
+    if (sigprocmask(SIG_BLOCK, &set, &oldset) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "sigprocmask() failed");
+        return NGX_ERROR;
+    }
+
+    if (ngx_terminate || ngx_quit || ngx_reconfigure || ngx_reopen) {
+        timer = 0;
+    }
+
+    if (ngx_event_timer_alarm) {
+        ngx_event_timer_alarm = 0;
+        ngx_time_update();
+        timer = 0;
+    }
+
+    events = epoll_pwait(ep, event_list, (int) nevents, timer, &oldset);
 
     err = (events == -1) ? ngx_errno : 0;
+
+    if (sigprocmask(SIG_SETMASK, &oldset, NULL) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "sigprocmask() failed");
+        return NGX_ERROR;
+    }
 
     if (flags & NGX_UPDATE_TIME || ngx_event_timer_alarm) {
         ngx_time_update();
