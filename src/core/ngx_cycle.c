@@ -1216,7 +1216,8 @@ void
 ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user)
 {
     ngx_fd_t          fd;
-    ngx_uint_t        i;
+    ngx_uint_t        i, access;
+    ngx_file_info_t   fi;
     ngx_list_part_t  *part;
     ngx_open_file_t  *file;
 
@@ -1242,8 +1243,16 @@ ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user)
             file[i].flush(&file[i], cycle->log);
         }
 
+        access = NGX_FILE_DEFAULT_ACCESS;
+
+#if !(NGX_WIN32)
+        if (ngx_fd_info(file[i].fd, &fi) != NGX_FILE_ERROR) {
+            access = fi.st_mode & 0777;
+        }
+#endif
+
         fd = ngx_open_file(file[i].name.data, NGX_FILE_APPEND,
-                           NGX_FILE_CREATE_OR_OPEN, NGX_FILE_DEFAULT_ACCESS);
+                           NGX_FILE_CREATE_OR_OPEN, access);
 
         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                        "reopen file \"%s\", old:%d new:%d",
@@ -1257,8 +1266,6 @@ ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user)
 
 #if !(NGX_WIN32)
         if (user != (ngx_uid_t) NGX_CONF_UNSET_UINT) {
-            ngx_file_info_t  fi;
-
             if (ngx_file_info(file[i].name.data, &fi) == NGX_FILE_ERROR) {
                 ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
                               ngx_file_info_n " \"%s\" failed",
