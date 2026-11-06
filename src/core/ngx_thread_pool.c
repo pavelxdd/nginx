@@ -108,6 +108,8 @@ ngx_thread_pool_init(ngx_thread_pool_t *tp, ngx_log_t *log, ngx_pool_t *pool)
 {
     int             err;
     pthread_t       tid;
+    sigset_t        set, oldset;
+    ngx_int_t       rc;
     ngx_uint_t      n;
     pthread_attr_t  attr;
 
@@ -153,18 +155,42 @@ ngx_thread_pool_init(ngx_thread_pool_t *tp, ngx_log_t *log, ngx_pool_t *pool)
     }
 #endif
 
+    /* Block signals before creation so no new thread can handle them. */
+
+    sigfillset(&set);
+    sigdelset(&set, SIGILL);
+    sigdelset(&set, SIGFPE);
+    sigdelset(&set, SIGSEGV);
+    sigdelset(&set, SIGBUS);
+
+    err = pthread_sigmask(SIG_BLOCK, &set, &oldset);
+    if (err) {
+        ngx_log_error(NGX_LOG_ALERT, log, err, "pthread_sigmask() failed");
+        (void) pthread_attr_destroy(&attr);
+        return NGX_ERROR;
+    }
+
+    rc = NGX_OK;
+
     for (n = 0; n < tp->threads; n++) {
         err = pthread_create(&tid, &attr, ngx_thread_pool_cycle, tp);
         if (err) {
             ngx_log_error(NGX_LOG_ALERT, log, err,
                           "pthread_create() failed");
-            return NGX_ERROR;
+            rc = NGX_ERROR;
+            break;
         }
+    }
+
+    err = pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+    if (err) {
+        ngx_log_error(NGX_LOG_ALERT, log, err, "pthread_sigmask() failed");
+        rc = NGX_ERROR;
     }
 
     (void) pthread_attr_destroy(&attr);
 
-    return NGX_OK;
+    return rc;
 }
 
 
@@ -279,8 +305,6 @@ ngx_thread_pool_cycle(void *data)
 {
     ngx_thread_pool_t *tp = data;
 
-    int                 err;
-    sigset_t            set;
     ngx_thread_task_t  *task;
 
 #if 0
@@ -289,19 +313,6 @@ ngx_thread_pool_cycle(void *data)
 
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, tp->log, 0,
                    "thread in pool \"%V\" started", &tp->name);
-
-    sigfillset(&set);
-
-    sigdelset(&set, SIGILL);
-    sigdelset(&set, SIGFPE);
-    sigdelset(&set, SIGSEGV);
-    sigdelset(&set, SIGBUS);
-
-    err = pthread_sigmask(SIG_BLOCK, &set, NULL);
-    if (err) {
-        ngx_log_error(NGX_LOG_ALERT, tp->log, err, "pthread_sigmask() failed");
-        return NULL;
-    }
 
     for ( ;; ) {
         if (ngx_thread_mutex_lock(&tp->mtx, tp->log) != NGX_OK) {
