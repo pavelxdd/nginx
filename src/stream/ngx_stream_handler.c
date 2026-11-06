@@ -185,6 +185,10 @@ ngx_stream_init_connection(ngx_connection_t *c)
 
         rev->handler = ngx_stream_proxy_protocol_handler;
 
+        if (c->type == SOCK_DGRAM) {
+            rev->ready = 1;
+        }
+
         if (!rev->ready) {
             ngx_add_timer(rev, cscf->proxy_protocol_timeout);
 
@@ -227,6 +231,33 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out");
         ngx_stream_finalize_session(s, NGX_STREAM_OK);
         return;
+    }
+
+    if (c->type == SOCK_DGRAM) {
+
+        if (c->buffer == NULL || c->buffer->pos == c->buffer->last) {
+            ngx_stream_finalize_session(s, NGX_STREAM_BAD_REQUEST);
+            return;
+        }
+
+        p = ngx_proxy_protocol_read(c, c->buffer->pos, c->buffer->last);
+
+        if (p == NULL) {
+            ngx_stream_finalize_session(s, NGX_STREAM_BAD_REQUEST);
+            return;
+        }
+
+        c->buffer->pos = p;
+
+        if (c->buffer->pos == c->buffer->last) {
+            c->buffer->pos = c->buffer->start;
+            c->buffer->last = c->buffer->start;
+        }
+
+        /* Each PROXY header applies to one UDP datagram. */
+        ngx_delete_udp_connection(c);
+
+        goto done;
     }
 
     n = recv(c->fd, (char *) buf, sizeof(buf), MSG_PEEK);
@@ -277,6 +308,8 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
+
+done:
 
     c->log->action = "initializing session";
 
