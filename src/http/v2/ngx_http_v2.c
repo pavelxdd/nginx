@@ -655,6 +655,11 @@ ngx_http_v2_handle_connection(ngx_http_v2_connection_t *h2c)
         /* rc == NGX_OK */
     }
 
+    if (c->error_close) {
+        ngx_http_close_connection(c);
+        return;
+    }
+
     if (h2c->goaway) {
         ngx_http_v2_lingering_close(c);
         return;
@@ -1203,7 +1208,7 @@ ngx_http_v2_state_headers(ngx_http_v2_connection_t *h2c, u_char *pos,
         return ngx_http_v2_connection_error(h2c, NGX_HTTP_V2_SIZE_ERROR);
     }
 
-    if (h2c->goaway) {
+    if (h2c->goaway || h2c->connection->error_close) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, h2c->connection->log, 0,
                        "skipping http2 HEADERS frame");
         return ngx_http_v2_state_skip(h2c, pos, end);
