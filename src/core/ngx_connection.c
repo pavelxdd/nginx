@@ -603,10 +603,74 @@ ngx_get_listening_transparent_option(ngx_listening_t *ls, int *level,
 #endif
 
 
+#if (NGX_HAVE_UNIX_DOMAIN)
+
+static ngx_int_t
+ngx_remove_stale_unix_socket(ngx_listening_t *ls, ngx_log_t *log)
+{
+    ngx_err_t             err;
+    ngx_socket_t          s;
+    ngx_file_info_t       fi, ofi;
+    struct sockaddr_un   *saun;
+
+    saun = (struct sockaddr_un *) ls->sockaddr;
+
+    if (saun->sun_path[0] == '\0'
+        || ngx_link_info(saun->sun_path, &ofi) == NGX_FILE_ERROR
+        || !S_ISSOCK(ofi.st_mode))
+    {
+        return NGX_DECLINED;
+    }
+
+    s = ngx_socket(AF_UNIX, ls->type, ls->protocol);
+    if (s == (ngx_socket_t) -1) {
+        return NGX_DECLINED;
+    }
+
+    err = 0;
+
+    if (ngx_nonblocking(s) != -1
+        && connect(s, ls->sockaddr, ls->socklen) == -1)
+    {
+        err = ngx_socket_errno;
+    }
+
+    if (ngx_close_socket(s) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_socket_errno,
+                      ngx_close_socket_n " %V failed", &ls->addr_text);
+        return NGX_DECLINED;
+    }
+
+    if (err != NGX_ECONNREFUSED) {
+        return NGX_DECLINED;
+    }
+
+    /* Do not unlink a path replaced while probing the socket. */
+    if (ngx_link_info(saun->sun_path, &fi) == NGX_FILE_ERROR
+        || !S_ISSOCK(fi.st_mode)
+        || fi.st_dev != ofi.st_dev
+        || fi.st_ino != ofi.st_ino)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_delete_file(saun->sun_path) == NGX_FILE_ERROR) {
+        return NGX_DECLINED;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                  "removed stale unix socket %V", &ls->addr_text);
+
+    return NGX_OK;
+}
+
+#endif
+
+
 ngx_int_t
 ngx_open_listening_sockets(ngx_cycle_t *cycle)
 {
-    int               reuseaddr;
+    int               reuseaddr, rc;
 #if (NGX_HAVE_TRANSPARENT_PROXY)
     int               level, option, value;
     const char       *option_name;
@@ -896,7 +960,28 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
             ngx_log_debug2(NGX_LOG_DEBUG_CORE, log, 0,
                            "bind() %V #%d ", &ls[i].addr_text, s);
 
-            if (bind(s, ls[i].sockaddr, ls[i].socklen) == -1) {
+            rc = bind(s, ls[i].sockaddr, ls[i].socklen);
+
+#if (NGX_HAVE_UNIX_DOMAIN)
+
+            if (rc == -1 && ngx_socket_errno == NGX_EADDRINUSE
+                && !ngx_test_config && tries == 5
+                && ls[i].fd == (ngx_socket_t) -1
+                && ls[i].sockaddr->sa_family == AF_UNIX)
+            {
+                err = ngx_socket_errno;
+
+                if (ngx_remove_stale_unix_socket(&ls[i], log) == NGX_OK) {
+                    rc = bind(s, ls[i].sockaddr, ls[i].socklen);
+
+                } else {
+                    ngx_set_socket_errno(err);
+                }
+            }
+
+#endif
+
+            if (rc == -1) {
                 err = ngx_socket_errno;
 
                 if (err != NGX_EADDRINUSE || !ngx_test_config) {
