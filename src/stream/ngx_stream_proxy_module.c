@@ -95,6 +95,10 @@ static void ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc);
 static u_char *ngx_stream_proxy_log_error(ngx_log_t *log, u_char *buf,
     size_t len);
 
+void proto_detect_server_first_prefix(ngx_stream_session_t *s, size_t len);
+ngx_uint_t proto_detect_server_first_finalize(ngx_stream_session_t *s,
+    ngx_uint_t rc);
+
 static void *ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -1073,6 +1077,8 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
 
         cl->next = u->upstream_out;
         u->upstream_out = cl;
+
+        proto_detect_server_first_prefix(s, size);
 
         u->proxy_protocol = 0;
     }
@@ -2067,6 +2073,11 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                     return;
                 }
 
+                if (rc == NGX_STREAM_FORBIDDEN) {
+                    ngx_stream_proxy_finalize(s, NGX_STREAM_FORBIDDEN);
+                    return;
+                }
+
                 ngx_chain_update_chains(c->pool, &u->free, busy, out,
                                       (ngx_buf_tag_t) &ngx_stream_proxy_module);
 
@@ -2370,6 +2381,8 @@ ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
     ngx_uint_t              state;
     ngx_connection_t       *pc;
     ngx_stream_upstream_t  *u;
+
+    rc = proto_detect_server_first_finalize(s, rc);
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
                    "finalize stream proxy: %i", rc);
