@@ -42,6 +42,8 @@ fi
 
 # create Makefile
 
+if [ "$NGX_TOPLEVEL_MAKEFILE" = YES ]; then
+
 cat << END > Makefile
 
 default:	build
@@ -51,3 +53,5 @@ clean:
 
 .PHONY:	default clean
 END
+
+fi

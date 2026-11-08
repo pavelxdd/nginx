@@ -196,6 +196,8 @@ done
 
 # create Makefile
 
+if [ "$NGX_TOPLEVEL_MAKEFILE" = YES ]; then
+
 cat << END >> Makefile
 
 build:
@@ -218,3 +220,5 @@ upgrade:
 
 .PHONY:	build install modules upgrade
 END
+
+fi

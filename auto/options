@@ -20,6 +20,7 @@ NGX_BUILD=
 CC=${CC:-cc}
 CPP=
 NGX_OBJS=objs
+NGX_TOPLEVEL_MAKEFILE=YES
 
 NGX_DEBUG=NO
 NGX_CC_OPT=
@@ -213,6 +214,7 @@ do
 
         --build=*)                       NGX_BUILD="$value"         ;;
         --builddir=*)                    NGX_OBJS="$value"          ;;
+        --without-makefile)              NGX_TOPLEVEL_MAKEFILE=NO   ;;
 
         --with-select_module)            EVENT_SELECT=YES           ;;
         --without-select_module)         EVENT_SELECT=NONE          ;;
@@ -464,6 +466,7 @@ cat << END
 
   --build=NAME                       set build name
   --builddir=DIR                     set build directory
+  --without-makefile                 disable top-level Makefile
 
   --with-select_module               enable select module
   --without-select_module            disable select module
