@@ -302,6 +302,13 @@ struct ngx_stream_session_s {
     unsigned                       health_check:1;
 
     unsigned                       limit_conn_status:2;
+
+    /*
+     * Before proxy I/O, take both event handlers on each socket and the
+     * selected peer lease.  Release the lease before the session pool dies.
+     */
+    void                         (*proxy_connected)(ngx_stream_session_t *s,
+                                      ngx_peer_connection_t *peer);
 };
 
 

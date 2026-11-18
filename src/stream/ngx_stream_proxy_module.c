@@ -489,6 +489,19 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "proxy connection handler");
 
+    if (s->proxy_connected
+        && (c->type != SOCK_STREAM || pscf->proxy_protocol
+#if (NGX_STREAM_SSL)
+            || pscf->ssl_enable
+#endif
+           ))
+    {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "proxy connection handoff requires a plain TCP upstream");
+        ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
     u = ngx_pcalloc(c->pool, sizeof(ngx_stream_upstream_t));
     if (u == NULL) {
         ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
@@ -546,19 +559,21 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
         return;
     }
 
-    p = ngx_pnalloc(c->pool, pscf->buffer_size);
-    if (p == NULL) {
-        ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-        return;
-    }
+    if (!s->proxy_connected) {
+        p = ngx_pnalloc(c->pool, pscf->buffer_size);
+        if (p == NULL) {
+            ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
 
-    u->downstream_buf.start = p;
-    u->downstream_buf.end = p + pscf->buffer_size;
-    u->downstream_buf.pos = p;
-    u->downstream_buf.last = p;
+        u->downstream_buf.start = p;
+        u->downstream_buf.end = p + pscf->buffer_size;
+        u->downstream_buf.pos = p;
+        u->downstream_buf.last = p;
 
-    if (c->read->ready) {
-        ngx_post_event(c->read, &ngx_posted_events);
+        if (c->read->ready) {
+            ngx_post_event(c->read, &ngx_posted_events);
+        }
     }
 
     if (pscf->upstream_value) {
@@ -1020,6 +1035,14 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
     if (u->peer.notify) {
         u->peer.notify(&u->peer, u->peer.data,
                        NGX_STREAM_UPSTREAM_NOTIFY_CONNECT);
+    }
+
+    if (s->proxy_connected) {
+        /* The peer must not destroy the downstream pool on close. */
+        pc->pool = NULL;
+        pc->data = NULL;
+        s->proxy_connected(s, &u->peer);
+        return;
     }
 
     if (u->upstream_buf.start == NULL) {
@@ -1848,6 +1871,10 @@ ngx_stream_proxy_process_connection(ngx_event_t *ev, ngx_uint_t from_upstream)
     if (c->close) {
         ngx_log_error(NGX_LOG_INFO, c->log, 0, "shutdown timeout");
         ngx_stream_proxy_finalize(s, NGX_STREAM_OK);
+        return;
+    }
+
+    if (s->proxy_connected) {
         return;
     }
 
